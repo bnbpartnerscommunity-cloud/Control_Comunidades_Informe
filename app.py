@@ -11,7 +11,10 @@ import streamlit as st
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
-st.set_page_config(page_title="Control Edificio Pro – Acceso", page_icon="🛡️", layout="wide")
+# =========================
+# App Config
+# =========================
+st.set_page_config(page_title="Control Comunidades – Acceso", page_icon="🛡️", layout="wide")
 
 REQUIRED_TABS = ["Users", "Invites", "Communities", "UserCommunityAccess"]
 
@@ -34,6 +37,9 @@ ROLES = ["admin", "supervisor", "conserje", "viewer"]
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
+# =========================
+# Basic helpers
+# =========================
 def norm_email(email: str) -> str:
     return (email or "").strip().lower()
 
@@ -58,6 +64,9 @@ def parse_iso(s: str) -> Optional[datetime]:
         return None
 
 
+# =========================
+# Secrets
+# =========================
 SHEET_ID = st.secrets["SHEET_ID"]
 APP_PEPPER = str(st.secrets.get("APP_PEPPER", "CHANGE_ME"))
 BOOTSTRAP_ADMIN_EMAILS = [
@@ -66,8 +75,12 @@ BOOTSTRAP_ADMIN_EMAILS = [
     if x.strip()
 ]
 INVITE_EXPIRY_HOURS = int(str(st.secrets.get("INVITE_EXPIRY_HOURS", "48")))
+BOOTSTRAP_SETUP_TOKEN = str(st.secrets.get("BOOTSTRAP_SETUP_TOKEN", ""))
 
 
+# =========================
+# Google API (Service Account - MODO B)
+# =========================
 @st.cache_resource
 def get_creds():
     info = {
@@ -94,6 +107,9 @@ def sheets_service():
     return build("sheets", "v4", credentials=get_creds())
 
 
+# =========================
+# Password & Invite hashing (stdlib only)
+# =========================
 def pbkdf2_hash_password(password: str, pepper: str, iterations: int = 210_000) -> str:
     salt = secrets.token_bytes(16)
     pw = (password + pepper).encode("utf-8")
@@ -136,6 +152,9 @@ def verify_invite_code(code: str, stored: str, pepper: str) -> bool:
         return False
 
 
+# =========================
+# Sheets helpers
+# =========================
 def sheets_get(spreadsheet_id: str):
     return sheets_service().spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
 
@@ -218,6 +237,9 @@ def write_table(tab: str, headers: List[str], rows: List[Dict[str, str]]):
     sheets_values_update(f"{tab}!A1", out)
 
 
+# =========================
+# Data layer ops
+# =========================
 def bootstrap_admin_users():
     _, users = read_table("Users")
     changed = False
@@ -380,6 +402,9 @@ def revoke_access(email: str, community_id: str):
     write_table("UserCommunityAccess", ACCESS_HEADERS, rows)
 
 
+# =========================
+# Session auth
+# =========================
 @dataclass
 class AuthUser:
     email: str
@@ -403,34 +428,60 @@ def clear_auth():
     st.session_state.pop("selected_community_id", None)
 
 
-# Boot
+# =========================
+# Boot (ensure schema + bootstrap admins)
+# =========================
 ensure_sheet_tabs_and_headers()
 bootstrap_admin_users()
 
 auth = get_auth()
 
+# =========================
+# UI - Login
+# =========================
 st.title("🛡️ Control Edificio Pro — Acceso")
+
 st.info(
-    "Elige cómo ingresar:\n"
-    "• Si ya tienes contraseña: usa **Ingreso con contraseña**.\n"
-    "• Si es tu primer acceso: usa **Primer acceso con código**, valida el código y luego define contraseña."
+    "Formas de ingreso:\n"
+    "• **Ingreso con contraseña**: para usuarios ya activados.\n"
+    "• **Primer acceso con código**: el admin genera un código (48h). Luego defines tu contraseña.\n"
+    "• **Activación inicial**: solo para admins bootstrap (requiere token secreto)."
 )
 
-# Login UI
 if not auth:
-    # Bootstrap helper (muy importante para tu caso)
-    with st.expander("🧰 Soy admin inicial y necesito mi primer código"):
-        st.write("Para los admins iniciales, el usuario se crea sin contraseña. Genera tu código y entra por 'Primer acceso con código'.")
-        bootstrap_email = st.text_input("Mi email admin", value="bnbpartnerscommunity@gmail.com")
-        if st.button("Generar código para mi email (48h)"):
-            em = norm_email(bootstrap_email)
-            if em not in BOOTSTRAP_ADMIN_EMAILS:
-                st.error("Ese correo no está en BOOTSTRAP_ADMIN_EMAILS.")
-            else:
-                code = generate_invite(em, em)
-                st.success("Código generado. Úsalo abajo en 'Primer acceso con código'.")
-                st.code(code)
+    # ---- Secure bootstrap activation (no codes generated) ----
+    with st.expander("🧰 Activación inicial (solo admins bootstrap)"):
+        st.caption("Esto solo se usa una vez para el primer ingreso del admin inicial. Requiere token secreto (definido en Secrets).")
 
+        b_email = st.text_input("Email admin bootstrap", placeholder="bnbpartnerscommunity@gmail.com")
+        b_token = st.text_input("Token secreto", type="password", placeholder="(definido en Secrets)")
+        b_pass1 = st.text_input("Nueva contraseña", type="password", key="bpass1")
+        b_pass2 = st.text_input("Repetir contraseña", type="password", key="bpass2")
+
+        if st.button("Activar admin"):
+            em = norm_email(b_email)
+            if em not in BOOTSTRAP_ADMIN_EMAILS:
+                st.error("Ese correo no está autorizado como admin bootstrap.")
+            elif not BOOTSTRAP_SETUP_TOKEN:
+                st.error("Falta BOOTSTRAP_SETUP_TOKEN en Secrets.")
+            elif b_token != BOOTSTRAP_SETUP_TOKEN:
+                st.error("Token secreto incorrecto.")
+            elif b_pass1 != b_pass2:
+                st.error("Las contraseñas no coinciden.")
+            elif len(b_pass1) < 8 or not any(c.isdigit() for c in b_pass1) or not any(c.isalpha() for c in b_pass1):
+                st.error("Contraseña débil: mínimo 8 caracteres, al menos 1 letra y 1 número.")
+            else:
+                u = get_user_by_email(em)
+                if not u:
+                    st.error("Usuario bootstrap no existe en Users. Revisa BOOTSTRAP_ADMIN_EMAILS y recarga.")
+                else:
+                    u["password_hash"] = pbkdf2_hash_password(b_pass1, APP_PEPPER)
+                    u["last_login_at"] = iso(now_utc())
+                    upsert_user(u)
+                    st.success("Admin activado. Ahora puedes ingresar con contraseña.")
+                    st.info("Ve a 'Ingreso con contraseña' con tu email y la contraseña que definiste.")
+
+    # ---- Normal login / invite flow ----
     c1, c2 = st.columns([1.05, 1], gap="large")
 
     with c1:
@@ -449,18 +500,22 @@ if not auth:
                 else:
                     stored = u.get("password_hash", "")
                     if not stored:
-                        st.error("Este usuario no tiene contraseña aún. Debe ingresar con código inicial.")
+                        st.error("Este usuario no tiene contraseña aún. Debe ingresar con código inicial (emitido por admin).")
                     elif pbkdf2_verify_password(password, stored, APP_PEPPER):
                         u["last_login_at"] = iso(now_utc())
                         upsert_user(u)
-                        set_auth(AuthUser(email=em, full_name=u.get("full_name", "") or em, is_admin=(u.get("is_admin", "").upper() == "TRUE")))
+                        set_auth(AuthUser(
+                            email=em,
+                            full_name=u.get("full_name", "") or em,
+                            is_admin=(u.get("is_admin", "").upper() == "TRUE")
+                        ))
                         st.rerun()
                     else:
                         st.error("Contraseña incorrecta.")
 
     with c2:
         st.subheader("Primer acceso con código")
-        st.caption(f"Código temporal con vigencia de {INVITE_EXPIRY_HOURS} horas.")
+        st.caption(f"Código temporal con vigencia de {INVITE_EXPIRY_HOURS} horas (lo genera un admin).")
         email2 = st.text_input("Email", key="invite_email", placeholder="usuario@empresa.com")
         code = st.text_input("Código (6 dígitos)", key="invite_code", max_chars=6)
 
@@ -518,19 +573,166 @@ if not auth:
                 st.session_state.pop("pending_set_password_email", None)
                 st.session_state.pop("pending_invite_created_at", None)
 
-                set_auth(AuthUser(email=pending_email, full_name=u.get("full_name", "") or pending_email, is_admin=(u.get("is_admin", "").upper() == "TRUE")))
+                set_auth(AuthUser(
+                    email=pending_email,
+                    full_name=u.get("full_name", "") or pending_email,
+                    is_admin=(u.get("is_admin", "").upper() == "TRUE")
+                ))
                 st.success("Contraseña guardada. Sesión iniciada.")
                 st.rerun()
 
     st.stop()
 
-
+# =========================
+# After login: Main app shell + Admin panel
+# =========================
 st.sidebar.success(f"Conectado como: {auth.full_name} ({auth.email})")
 if st.sidebar.button("Cerrar sesión"):
     clear_auth()
     st.rerun()
 
-st.subheader("✅ Acceso listo")
-st.info("Ya estás dentro. Siguiente paso: panel admin + comunidades + reportes.")
+st.header("🏢 Comunidades")
 
+access = list_user_access(auth.email)
+comm_map = {c["community_id"]: c for c in list_communities()}
 
+allowed = []
+for a in access:
+    cid = a.get("community_id", "")
+    if cid in comm_map:
+        allowed.append({
+            "community_id": cid,
+            "community_name": comm_map[cid].get("community_name", cid),
+            "role": (a.get("role", "") or "viewer").lower()
+        })
+
+if auth.is_admin:
+    for cid, c in comm_map.items():
+        if not any(x["community_id"] == cid for x in allowed):
+            allowed.append({"community_id": cid, "community_name": c.get("community_name", cid), "role": "admin"})
+
+allowed = sorted(allowed, key=lambda x: x["community_name"])
+
+if not allowed:
+    st.warning("No tienes comunidades asignadas. Pide al admin que te otorgue acceso.")
+else:
+    labels = [f"{x['community_name']} ({x['community_id']}) — rol: {x['role']}" for x in allowed]
+    idx = 0
+    current = st.session_state.get("selected_community_id")
+    if current:
+        for i, x in enumerate(allowed):
+            if x["community_id"] == current:
+                idx = i
+                break
+    sel = st.selectbox("Selecciona comunidad", options=list(range(len(allowed))), format_func=lambda i: labels[i], index=idx)
+    st.session_state["selected_community_id"] = allowed[sel]["community_id"]
+    st.info("✅ Listo. Próximo paso: Reportes Draft/Final + checklist por comunidad + fotos en Drive.")
+
+# ---- Admin Panel ----
+if auth.is_admin:
+    st.divider()
+    st.header("🧑‍💼 Panel Admin")
+
+    tab_u, tab_c, tab_a = st.tabs(["👤 Usuarios", "🏢 Comunidades", "🔐 Accesos"])
+
+    with tab_c:
+        st.subheader("Crear comunidad")
+        name = st.text_input("Nombre de la comunidad", placeholder="Ej: Edificio A - Los Castaños")
+        if st.button("Crear comunidad"):
+            if not name.strip():
+                st.error("Indica un nombre.")
+            else:
+                row = create_community(name.strip())
+                st.success(f"Comunidad creada: {row['community_name']} ({row['community_id']})")
+                st.rerun()
+
+        st.markdown("#### Comunidades actuales")
+        comms = list_communities()
+        if not comms:
+            st.write("No hay comunidades aún.")
+        else:
+            st.dataframe(comms, use_container_width=True)
+
+    with tab_u:
+        st.subheader(f"Crear/actualizar usuario + generar código ({INVITE_EXPIRY_HOURS}h)")
+        email = st.text_input("Email del usuario", key="admin_new_user_email", placeholder="persona@empresa.com")
+        full_name = st.text_input("Nombre completo", key="admin_new_user_name", placeholder="Juan Pérez")
+        is_admin_flag = st.checkbox("¿Es admin global?", value=False)
+
+        comms = list_communities()
+        comm_choices = {f"{c['community_name']} ({c['community_id']})": c["community_id"] for c in comms}
+        selected_comm_labels = st.multiselect("Asignar a comunidades", options=list(comm_choices.keys()))
+        role = st.selectbox("Rol en esas comunidades", options=ROLES, index=1)
+
+        if st.button("Crear/actualizar usuario + generar código"):
+            em = norm_email(email)
+            if not EMAIL_RE.match(em):
+                st.error("Email inválido.")
+            elif not full_name.strip():
+                st.error("Indica nombre completo.")
+            else:
+                existing = get_user_by_email(em)
+                if not existing:
+                    u = {
+                        "user_id": f"USR-{secrets.token_hex(4)}",
+                        "email": em,
+                        "full_name": full_name.strip(),
+                        "is_admin": "TRUE" if is_admin_flag else "FALSE",
+                        "is_active": "TRUE",
+                        "password_hash": "",
+                        "created_at": iso(now_utc()),
+                        "last_login_at": "",
+                    }
+                else:
+                    u = existing
+                    u["full_name"] = full_name.strip()
+                    u["is_admin"] = "TRUE" if is_admin_flag else "FALSE"
+                    u["is_active"] = "TRUE"
+
+                upsert_user(u)
+
+                for lbl in selected_comm_labels:
+                    cid = comm_choices[lbl]
+                    grant_access(em, cid, role)
+
+                code = generate_invite(em, auth.email)
+                st.success("Usuario listo. Copia el código y envíaselo por WhatsApp/correo.")
+                st.code(f"Código para {em}: {code}", language="text")
+
+    with tab_a:
+        st.subheader("Administrar accesos por comunidad")
+        _, users = read_table("Users")
+        users_active = [u for u in users if u.get("is_active", "").upper() == "TRUE" and u.get("email")]
+        users_active = sorted(users_active, key=lambda u: u.get("email", ""))
+        user_emails = [u["email"] for u in users_active]
+
+        if not user_emails:
+            st.warning("No hay usuarios activos.")
+        else:
+            target = st.selectbox("Usuario", options=user_emails)
+            st.markdown("##### Accesos actuales")
+            current_access = list_user_access(target)
+            if current_access:
+                st.dataframe(current_access, use_container_width=True)
+            else:
+                st.write("Sin accesos asignados.")
+
+            st.markdown("##### Otorgar o actualizar acceso")
+            comms = list_communities()
+            comm_choices = {f"{c['community_name']} ({c['community_id']})": c["community_id"] for c in comms}
+            comm_label = st.selectbox("Comunidad", options=list(comm_choices.keys()))
+            role = st.selectbox("Rol", options=ROLES, index=1)
+
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("Guardar acceso"):
+                    grant_access(target, comm_choices[comm_label], role)
+                    st.success("Acceso actualizado.")
+                    st.rerun()
+            with col2:
+                if st.button("Revocar acceso"):
+                    revoke_access(target, comm_choices[comm_label])
+                    st.success("Acceso revocado.")
+                    st.rerun()
+
+st.caption("MVP: Auth seguro (bootstrap por token) + invitaciones por admin + comunidades y accesos en Sheets.")
