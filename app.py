@@ -42,7 +42,7 @@ INVITES_HEADERS = [
     "email", "invite_code_hash", "expires_at", "used_at",
     "created_by", "created_at"
 ]
-# ✅ agregamos foto opcional de comunidad
+# ✅ foto opcional de comunidad
 COMM_HEADERS = [
     "community_id", "community_name", "is_active",
     "cover_file_id", "cover_web_view_link",
@@ -167,7 +167,7 @@ def authed_session() -> AuthorizedSession:
     return AuthorizedSession(get_creds())
 
 # =========================
-# API wrappers (with backoff + cache)
+# API wrappers (backoff + cache)
 # =========================
 def _gs_url(path: str) -> str:
     return "https://sheets.googleapis.com" + path
@@ -234,9 +234,11 @@ def sheets_batch_update(reqs: List[dict]):
 # -------- Drive helpers --------
 @st.cache_data(ttl=120, show_spinner=False)
 def drive_find_folder_id(parent_id: str, name: str) -> Optional[str]:
+    # ✅ FIX: evitar escapes dentro del f-string
+    safe_name = (name or "").replace("'", "\\'")
     q = (
-        f"mimeType='application/vnd.google-apps.folder' and "
-        f"name='{name.replace(\"'\", \"\\'\")}' and "
+        "mimeType='application/vnd.google-apps.folder' and "
+        f"name='{safe_name}' and "
         f"'{parent_id}' in parents and trashed=false"
     )
     data = _request_with_backoff("GET", _drive_url("/files"), params={"q": q, "fields": "files(id,name)"})
@@ -263,7 +265,6 @@ def drive_upload_image_bytes(parent_folder_id: str, filename: str, content_type:
     delimiter = f"\r\n--{boundary}\r\n"
     close_delim = f"\r\n--{boundary}--\r\n"
 
-    # NOTE: json.dumps via requests.utils.json might not exist in all versions, use stdlib
     import json as _json
 
     multipart_body = (
@@ -727,7 +728,6 @@ def get_check_rows_map(community_id: str, check_date: str, report_state: str) ->
     return out
 
 def list_report_dates_for_community(community_id: str) -> List[Tuple[str, str]]:
-    # returns list of (date, state) existing
     _, rows = read_table("Checklists")
     s = set()
     for r in rows:
@@ -905,7 +905,6 @@ if st.sidebar.button("Cerrar sesión"):
     clear_auth()
     st.rerun()
 
-# Build allowed communities for this user
 access = list_user_access(auth.email, include_inactive=False)
 comm_map = {c["community_id"]: c for c in list_communities(include_inactive=False)}
 
@@ -920,7 +919,6 @@ for a in access:
             "cover_link": comm_map[cid].get("cover_web_view_link", ""),
         })
 
-# Admin sees all communities
 if auth.is_admin:
     for cid, c in comm_map.items():
         if not any(x["community_id"] == cid for x in allowed):
@@ -933,7 +931,6 @@ if auth.is_admin:
 
 allowed.sort(key=lambda x: x["community_name"])
 
-# ========= MODULES =========
 if auth.is_admin:
     module = st.sidebar.radio("Módulos", ["🏘️ Comunidades", "🧑‍💼 Administrador"], index=0)
 else:
@@ -949,8 +946,6 @@ if module == "🏘️ Comunidades":
         st.warning("No tienes comunidades asignadas. Pide al admin que te otorgue acceso.")
         st.stop()
 
-    # cards-like selector
-    st.caption("Selecciona una comunidad para elaborar o consultar informes.")
     labels = [f"{x['community_name']} ({x['community_id']})" for x in allowed]
 
     default_idx = 0
@@ -967,7 +962,6 @@ if module == "🏘️ Comunidades":
     role = sel_comm["role"]
     st.session_state["selected_community_id"] = community_id
 
-    # header card
     cover = sel_comm.get("cover_link", "")
     left, right = st.columns([2.2, 1])
     with left:
@@ -979,10 +973,8 @@ if module == "🏘️ Comunidades":
         else:
             st.caption("Sin foto de comunidad")
 
-    # Tabs inside a community
     tab_work, tab_history = st.tabs(["🧾 Informe (Draft/Final)", "📚 Historial de informes"])
 
-    # ---- Work tab ----
     with tab_work:
         inst_all = list_installations(community_id, include_inactive=True)
         if not inst_all:
@@ -995,7 +987,7 @@ if module == "🏘️ Comunidades":
 
         inst = list_installations(community_id, include_inactive=False)
         if not inst:
-            st.warning("No hay instalaciones activas (puede que estén desactivadas).")
+            st.warning("No hay instalaciones activas.")
             st.stop()
 
         c1, c2 = st.columns([1, 1])
@@ -1031,7 +1023,7 @@ if module == "🏘️ Comunidades":
             unsafe_allow_html=True
         )
 
-        can_edit = (role in EDIT_ROLES)  # viewer => False
+        can_edit = (role in EDIT_ROLES)
 
         if not FOTOS_ROOT_FOLDER_ID:
             st.warning("⚠️ FOTOS_ROOT_FOLDER_ID no está configurado: no podrás subir fotos.")
@@ -1137,7 +1129,6 @@ if module == "🏘️ Comunidades":
                                     st.error("No pude subir la foto a Drive.")
                                     st.exception(e)
 
-                    # Persist status + note (viewer no escribe)
                     if can_edit:
                         upsert_check_row(
                             community_id=community_id,
@@ -1152,7 +1143,6 @@ if module == "🏘️ Comunidades":
                         )
             st.divider()
 
-    # ---- History tab ----
     with tab_history:
         st.subheader("📚 Historial de informes")
         items = list_report_dates_for_community(community_id)
@@ -1243,7 +1233,6 @@ if module == "🧑‍💼 Administrador":
             else:
                 row = create_community(name.strip())
                 st.success(f"Comunidad creada: {row['community_name']} ({row['community_id']})")
-                # (Opcional) asignar acceso explícito al creador
                 grant_access(auth.email, row["community_id"], "admin")
                 st.rerun()
 
@@ -1272,7 +1261,6 @@ if module == "🧑‍💼 Administrador":
                             set_community_active(c["community_id"], True)
                             st.rerun()
                 with col4:
-                    # optional cover photo upload
                     st.caption("Foto opcional de comunidad (Drive)")
                     up = st.file_uploader(
                         "Subir portada",
@@ -1286,7 +1274,6 @@ if module == "🧑‍💼 Administrador":
                         else:
                             if st.button("Guardar portada", key=f"save_cover_{c['community_id']}"):
                                 try:
-                                    # store in a stable folder: /COM__Name/_cover
                                     comm_folder = get_community_folder_id(c["community_id"], c["community_name"])
                                     cover_folder = drive_get_or_create_folder(comm_folder, "_cover")
                                     ext = up.type.split("/")[-1] if up.type and "/" in up.type else "jpg"
@@ -1414,5 +1401,5 @@ if module == "🧑‍💼 Administrador":
                     st.success("Acceso revocado.")
                     st.rerun()
 
-st.caption("✅ Módulo Comunidades (roles) + Admin (configuración). Próximo: export PDF/Word con fotos.")
+st.caption("✅ Módulo Comunidades + Admin + Drive/Sheets integrados.")
 
