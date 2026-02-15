@@ -5,7 +5,6 @@ import hashlib
 import secrets
 import time
 import requests
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone, date
 from typing import Dict, List, Optional, Tuple
 
@@ -14,12 +13,14 @@ from google.oauth2.service_account import Credentials
 from google.auth.transport.requests import AuthorizedSession
 
 # =========================
-# App Config
+# Config
 # =========================
 st.set_page_config(page_title="Control Comunidades", page_icon="🛡️", layout="wide")
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 ROLES = ["admin", "supervisor", "conserje", "viewer"]
+EDIT_ROLES = {"admin", "supervisor", "conserje"}
+VIEW_ONLY_ROLES = {"viewer"}
 
 # =========================
 # Sheets schema
@@ -41,16 +42,16 @@ INVITES_HEADERS = [
     "email", "invite_code_hash", "expires_at", "used_at",
     "created_by", "created_at"
 ]
+# ✅ agregamos foto opcional de comunidad
 COMM_HEADERS = [
-    "community_id", "community_name", "is_active", "created_at"
+    "community_id", "community_name", "is_active",
+    "cover_file_id", "cover_web_view_link",
+    "created_at"
 ]
-ACCESS_HEADERS = [
-    "email", "community_id", "role", "is_active"
-]
+ACCESS_HEADERS = ["email", "community_id", "role", "is_active"]
 INSTALL_HEADERS = [
     "installation_id", "community_id", "category", "installation_name", "is_active", "created_at"
 ]
-# ✅ agregamos 2 columnas para fotos persistentes
 CHECK_HEADERS = [
     "check_id", "community_id", "check_date", "report_state",
     "installation_id", "category", "installation_name",
@@ -113,6 +114,13 @@ def sanitize_name_for_folder(s: str) -> str:
     s = re.sub(r"\s+", " ", s)
     return s[:120].strip() or "SinNombre"
 
+def status_badge(status: str) -> str:
+    if status == "ok":
+        return "🟢 OK"
+    if status == "fail":
+        return "🔴 FALLA"
+    return "⚪ PEND."
+
 # =========================
 # Secrets
 # =========================
@@ -126,11 +134,10 @@ BOOTSTRAP_ADMIN_EMAILS = [
 INVITE_EXPIRY_HOURS = int(str(st.secrets.get("INVITE_EXPIRY_HOURS", "48")))
 BOOTSTRAP_SETUP_TOKEN = str(st.secrets.get("BOOTSTRAP_SETUP_TOKEN", ""))
 
-# ✅ Drive root folder for photos
 FOTOS_ROOT_FOLDER_ID = str(st.secrets.get("FOTOS_ROOT_FOLDER_ID", "")).strip()
 
 # =========================
-# Google Auth (AuthorizedSession)
+# Google Auth
 # =========================
 @st.cache_resource
 def get_creds():
@@ -160,29 +167,27 @@ def authed_session() -> AuthorizedSession:
     return AuthorizedSession(get_creds())
 
 # =========================
-# Sheets API (retry/backoff + cache)
+# API wrappers (with backoff + cache)
 # =========================
 def _gs_url(path: str) -> str:
     return "https://sheets.googleapis.com" + path
 
-def _request_with_backoff(method: str, url: str, *, params=None, json_body=None, timeout=30) -> dict:
+def _drive_url(path: str) -> str:
+    return "https://www.googleapis.com/drive/v3" + path
+
+def _request_with_backoff(method: str, url: str, *, params=None, json_body=None, data=None, headers=None, timeout=30) -> dict:
     sess = authed_session()
     max_attempts = 6
     base_sleep = 0.8
-
     for attempt in range(1, max_attempts + 1):
-        resp = sess.request(method, url, params=params, json=json_body, timeout=timeout)
-
+        resp = sess.request(method, url, params=params, json=json_body, data=data, headers=headers, timeout=timeout)
         if resp.status_code == 429:
             sleep_s = (base_sleep * (2 ** (attempt - 1))) + (secrets.randbelow(250) / 1000.0)
             time.sleep(min(sleep_s, 8.0))
             continue
-
         if resp.status_code >= 400:
             raise RuntimeError(f"API error {resp.status_code}: {resp.text}")
-
         return resp.json() if resp.text else {}
-
     raise RuntimeError("API request failed after retries (429).")
 
 @st.cache_data(ttl=12, show_spinner=False)
@@ -194,19 +199,6 @@ def sheets_values_get_cached(range_a1: str) -> List[List[str]]:
     enc = requests.utils.quote(range_a1, safe="")
     data = _request_with_backoff("GET", _gs_url(f"/v4/spreadsheets/{SHEET_ID}/values/{enc}"))
     return data.get("values", [])
-
-@st.cache_data(ttl=12, show_spinner=False)
-def sheets_batch_get_cached(ranges: Tuple[str, ...]) -> Dict[str, List[List[str]]]:
-    params = [("ranges", r) for r in ranges]
-    data = _request_with_backoff(
-        "GET",
-        _gs_url(f"/v4/spreadsheets/{SHEET_ID}/values:batchGet"),
-        params=params,
-    )
-    out = {}
-    for vr in data.get("valueRanges", []):
-        out[vr.get("range", "")] = vr.get("values", [])
-    return out
 
 def _invalidate_cache():
     st.cache_data.clear()
@@ -239,34 +231,21 @@ def sheets_batch_update(reqs: List[dict]):
     )
     _invalidate_cache()
 
-# =========================
-# Drive API (v3) helpers
-# =========================
-def _drive_url(path: str) -> str:
-    return "https://www.googleapis.com/drive/v3" + path
-
-def drive_request(method: str, path: str, *, params=None, json_body=None, timeout=30) -> dict:
-    return _request_with_backoff(method, _drive_url(path), params=params, json_body=json_body, timeout=timeout)
-
+# -------- Drive helpers --------
 @st.cache_data(ttl=120, show_spinner=False)
 def drive_find_folder_id(parent_id: str, name: str) -> Optional[str]:
-    # Search folder by name under parent
     q = (
         f"mimeType='application/vnd.google-apps.folder' and "
         f"name='{name.replace(\"'\", \"\\'\")}' and "
         f"'{parent_id}' in parents and trashed=false"
     )
-    data = drive_request("GET", "/files", params={"q": q, "fields": "files(id,name)"})
+    data = _request_with_backoff("GET", _drive_url("/files"), params={"q": q, "fields": "files(id,name)"})
     files = data.get("files", [])
     return files[0]["id"] if files else None
 
 def drive_create_folder(parent_id: str, name: str) -> str:
-    body = {
-        "name": name,
-        "mimeType": "application/vnd.google-apps.folder",
-        "parents": [parent_id],
-    }
-    data = drive_request("POST", "/files", params={"fields": "id"}, json_body=body)
+    body = {"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]}
+    data = _request_with_backoff("POST", _drive_url("/files"), params={"fields": "id"}, json_body=body)
     st.cache_data.clear()
     return data["id"]
 
@@ -278,24 +257,19 @@ def drive_get_or_create_folder(parent_id: str, name: str) -> str:
     return drive_create_folder(parent_id, name)
 
 def drive_upload_image_bytes(parent_folder_id: str, filename: str, content_type: str, file_bytes: bytes) -> Tuple[str, str]:
-    """
-    Upload using multipart/related (metadata + media) to Drive.
-    Returns (file_id, webViewLink)
-    """
     sess = authed_session()
-    metadata = {
-        "name": filename,
-        "parents": [parent_folder_id],
-    }
-
+    metadata = {"name": filename, "parents": [parent_folder_id]}
     boundary = "===============" + secrets.token_hex(12)
     delimiter = f"\r\n--{boundary}\r\n"
     close_delim = f"\r\n--{boundary}--\r\n"
 
+    # NOTE: json.dumps via requests.utils.json might not exist in all versions, use stdlib
+    import json as _json
+
     multipart_body = (
         delimiter
         + "Content-Type: application/json; charset=UTF-8\r\n\r\n"
-        + requests.utils.json.dumps(metadata)
+        + _json.dumps(metadata)
         + delimiter
         + f"Content-Type: {content_type}\r\n\r\n"
     ).encode("utf-8") + file_bytes + close_delim.encode("utf-8")
@@ -315,8 +289,57 @@ def drive_upload_image_bytes(parent_folder_id: str, filename: str, content_type:
         data = resp.json()
         st.cache_data.clear()
         return data["id"], data.get("webViewLink", "")
-
     raise RuntimeError("Drive upload failed after retries (429).")
+
+# =========================
+# Table utilities
+# =========================
+def ensure_sheet_tabs_and_headers():
+    meta = sheets_get_cached(SHEET_ID)
+    existing = {s["properties"]["title"] for s in meta.get("sheets", [])}
+
+    reqs = []
+    for title in REQUIRED_TABS:
+        if title not in existing:
+            reqs.append({"addSheet": {"properties": {"title": title}}})
+    if reqs:
+        sheets_batch_update(reqs)
+
+    def ensure_headers(tab: str, headers: List[str]):
+        vals = sheets_values_get_cached(f"{tab}!A1:Z1")
+        if not vals or not vals[0]:
+            sheets_values_update(f"{tab}!A1", [headers])
+            return
+        current = [str(x).strip() for x in vals[0]]
+        if current[: len(headers)] != headers:
+            sheets_values_update(f"{tab}!A1", [headers])
+
+    ensure_headers("Users", USERS_HEADERS)
+    ensure_headers("Invites", INVITES_HEADERS)
+    ensure_headers("Communities", COMM_HEADERS)
+    ensure_headers("UserCommunityAccess", ACCESS_HEADERS)
+    ensure_headers("Installations", INSTALL_HEADERS)
+    ensure_headers("Checklists", CHECK_HEADERS)
+
+def read_table(tab: str) -> Tuple[List[str], List[Dict[str, str]]]:
+    values = sheets_values_get_cached(f"{tab}!A1:Z")
+    if not values:
+        return [], []
+    headers = [str(x).strip() for x in values[0]]
+    rows: List[Dict[str, str]] = []
+    for r in values[1:]:
+        d: Dict[str, str] = {}
+        for i, h in enumerate(headers):
+            d[h] = str(r[i]).strip() if i < len(r) and r[i] is not None else ""
+        if any(v != "" for v in d.values()):
+            rows.append(d)
+    return headers, rows
+
+def write_table(tab: str, headers: List[str], rows: List[Dict[str, str]]):
+    out: List[List[str]] = [headers]
+    for d in rows:
+        out.append([d.get(h, "") for h in headers])
+    sheets_values_update(f"{tab}!A1", out)
 
 # =========================
 # Password & invite hashing
@@ -358,67 +381,6 @@ def verify_invite_code(code: str, stored: str, pepper: str) -> bool:
         return hmac.compare_digest(h, hexhash)
     except Exception:
         return False
-
-# =========================
-# Table utilities
-# =========================
-def ensure_sheet_tabs_and_headers():
-    meta = sheets_get_cached(SHEET_ID)
-    existing = {s["properties"]["title"] for s in meta.get("sheets", [])}
-
-    reqs = []
-    for title in REQUIRED_TABS:
-        if title not in existing:
-            reqs.append({"addSheet": {"properties": {"title": title}}})
-    if reqs:
-        sheets_batch_update(reqs)
-
-    ranges = (
-        "Users!A1:Z1",
-        "Invites!A1:Z1",
-        "Communities!A1:Z1",
-        "UserCommunityAccess!A1:Z1",
-        "Installations!A1:Z1",
-        "Checklists!A1:Z1",
-    )
-    got = sheets_batch_get_cached(ranges)
-
-    def ensure_headers(range_key: str, tab: str, headers: List[str]):
-        vals = got.get(range_key, [])
-        if not vals or not vals[0]:
-            sheets_values_update(f"{tab}!A1", [headers])
-            return
-        current = [str(x).strip() for x in vals[0]]
-        # Only ensure prefix matches; if sheet has fewer columns, update header row.
-        if current[: len(headers)] != headers:
-            sheets_values_update(f"{tab}!A1", [headers])
-
-    ensure_headers("Users!A1:Z1", "Users", USERS_HEADERS)
-    ensure_headers("Invites!A1:Z1", "Invites", INVITES_HEADERS)
-    ensure_headers("Communities!A1:Z1", "Communities", COMM_HEADERS)
-    ensure_headers("UserCommunityAccess!A1:Z1", "UserCommunityAccess", ACCESS_HEADERS)
-    ensure_headers("Installations!A1:Z1", "Installations", INSTALL_HEADERS)
-    ensure_headers("Checklists!A1:Z1", "Checklists", CHECK_HEADERS)
-
-def read_table(tab: str) -> Tuple[List[str], List[Dict[str, str]]]:
-    values = sheets_values_get_cached(f"{tab}!A1:Z")
-    if not values:
-        return [], []
-    headers = [str(x).strip() for x in values[0]]
-    rows: List[Dict[str, str]] = []
-    for r in values[1:]:
-        d: Dict[str, str] = {}
-        for i, h in enumerate(headers):
-            d[h] = str(r[i]).strip() if i < len(r) and r[i] is not None else ""
-        if any(v != "" for v in d.values()):
-            rows.append(d)
-    return headers, rows
-
-def write_table(tab: str, headers: List[str], rows: List[Dict[str, str]]):
-    out: List[List[str]] = [headers]
-    for d in rows:
-        out.append([d.get(h, "") for h in headers])
-    sheets_values_update(f"{tab}!A1", out)
 
 # =========================
 # Users / auth
@@ -475,7 +437,6 @@ def upsert_user(user: Dict[str, str]):
 def generate_invite(email: str, created_by: str) -> str:
     code = "".join(str(secrets.randbelow(10)) for _ in range(6))
     expires = now_utc() + timedelta(hours=INVITE_EXPIRY_HOURS)
-
     invite_row = {
         "email": norm_email(email),
         "invite_code_hash": hash_invite_code(code, APP_PEPPER),
@@ -512,11 +473,11 @@ def mark_invite_used(invite: Dict[str, str]):
             break
     write_table("Invites", INVITES_HEADERS, invites)
 
-@dataclass
 class AuthUser:
-    email: str
-    full_name: str
-    is_admin: bool
+    def __init__(self, email: str, full_name: str, is_admin: bool):
+        self.email = email
+        self.full_name = full_name
+        self.is_admin = is_admin
 
 def set_auth(user: AuthUser):
     st.session_state["auth"] = {"email": user.email, "full_name": user.full_name, "is_admin": user.is_admin}
@@ -558,7 +519,14 @@ def create_community(name: str) -> Dict[str, str]:
             pass
     next_n = (max(nums) + 1) if nums else 1
     cid = f"COM-{next_n:04d}"
-    row = {"community_id": cid, "community_name": name, "is_active": "TRUE", "created_at": iso(now_utc())}
+    row = {
+        "community_id": cid,
+        "community_name": name,
+        "is_active": "TRUE",
+        "cover_file_id": "",
+        "cover_web_view_link": "",
+        "created_at": iso(now_utc())
+    }
     sheets_values_append("Communities!A1", [[row.get(h, "") for h in COMM_HEADERS]])
     return row
 
@@ -567,6 +535,15 @@ def set_community_active(community_id: str, active: bool):
     for i, c in enumerate(comms):
         if c.get("community_id") == community_id:
             comms[i]["is_active"] = "TRUE" if active else "FALSE"
+            break
+    write_table("Communities", COMM_HEADERS, comms)
+
+def update_community_cover(community_id: str, file_id: str, web_link: str):
+    _, comms = read_table("Communities")
+    for i, c in enumerate(comms):
+        if c.get("community_id") == community_id:
+            comms[i]["cover_file_id"] = file_id
+            comms[i]["cover_web_view_link"] = web_link
             break
     write_table("Communities", COMM_HEADERS, comms)
 
@@ -631,14 +608,12 @@ def list_installations(community_id: str, include_inactive: bool = False) -> Lis
     return out
 
 def add_installation(community_id: str, category: str, name: str) -> Dict[str, str]:
-    category = category.strip()
-    name = name.strip()
     installation_id = f"INS-{secrets.token_hex(4)}"
     row = {
         "installation_id": installation_id,
         "community_id": community_id,
-        "category": category,
-        "installation_name": name,
+        "category": category.strip(),
+        "installation_name": name.strip(),
         "is_active": "TRUE",
         "created_at": iso(now_utc()),
     }
@@ -661,7 +636,7 @@ def seed_default_installations_if_empty(community_id: str):
         add_installation(community_id, cat, name)
 
 # =========================
-# Checklist persistence (+ photos)
+# Checklists
 # =========================
 def upsert_check_row(
     community_id: str,
@@ -674,9 +649,6 @@ def upsert_check_row(
     photo_file_id: str = "",
     photo_web_view_link: str = "",
 ):
-    """
-    Upsert by (community_id, check_date, report_state, installation_id)
-    """
     _, rows = read_table("Checklists")
     key_inst = inst["installation_id"]
 
@@ -698,7 +670,6 @@ def upsert_check_row(
         ):
             rows[i]["status"] = status
             rows[i]["note"] = note
-            # si viene foto nueva, actualiza; si viene vacío, conserva lo anterior
             if photo_file_id != "":
                 rows[i]["photo_file_id"] = photo_file_id
                 rows[i]["photo_web_view_link"] = photo_web_view_link
@@ -708,7 +679,7 @@ def upsert_check_row(
             break
 
     if not found:
-        row = {
+        rows.append({
             "check_id": f"CHK-{secrets.token_hex(4)}",
             "community_id": community_id,
             "check_date": check_date,
@@ -722,8 +693,7 @@ def upsert_check_row(
             "photo_web_view_link": photo_web_view_link,
             "updated_at": iso(now_utc()),
             "updated_by": norm_email(updated_by),
-        }
-        rows.append(row)
+        })
 
     write_table("Checklists", CHECK_HEADERS, rows)
 
@@ -755,6 +725,15 @@ def get_check_rows_map(community_id: str, check_date: str, report_state: str) ->
         ):
             out[r["installation_id"]] = r
     return out
+
+def list_report_dates_for_community(community_id: str) -> List[Tuple[str, str]]:
+    # returns list of (date, state) existing
+    _, rows = read_table("Checklists")
+    s = set()
+    for r in rows:
+        if r.get("community_id") == community_id and r.get("check_date") and r.get("report_state"):
+            s.add((r["check_date"], r["report_state"]))
+    return sorted(list(s), key=lambda x: (x[0], x[1]), reverse=True)
 
 # =========================
 # Drive folder routing
@@ -798,16 +777,11 @@ auth = get_auth()
 st.title("🛡️ Control Comunidades")
 
 if not auth:
-    st.info(
-        "Formas de ingreso:\n"
-        "• **Ingreso con contraseña**\n"
-        "• **Primer acceso con código** (admin lo genera)\n"
-        "• **Activación inicial** (solo admins bootstrap con token secreto)"
-    )
+    st.info("Ingreso con contraseña o primer acceso con código (admin).")
 
     with st.expander("🧰 Activación inicial (solo admins bootstrap)"):
         b_email = st.text_input("Email admin bootstrap", placeholder="bnbpartnerscommunity@gmail.com")
-        b_token = st.text_input("Token secreto", type="password", placeholder="(definido en Secrets)")
+        b_token = st.text_input("Token secreto", type="password", placeholder="(BOOTSTRAP_SETUP_TOKEN)")
         b_pass1 = st.text_input("Nueva contraseña", type="password", key="bpass1")
         b_pass2 = st.text_input("Repetir contraseña", type="password", key="bpass2")
 
@@ -833,62 +807,51 @@ if not auth:
                     upsert_user(u)
                     st.success("Admin activado. Ahora puedes ingresar con contraseña.")
 
-    c1, c2 = st.columns([1.05, 1], gap="large")
+    c1, c2 = st.columns([1, 1], gap="large")
 
     with c1:
         st.subheader("Ingreso con contraseña")
         email = st.text_input("Email", key="login_email", placeholder="usuario@empresa.com")
         password = st.text_input("Contraseña", type="password", key="login_password")
-
         if st.button("Ingresar", use_container_width=True):
             em = norm_email(email)
-            if not EMAIL_RE.match(em):
-                st.error("Email inválido.")
+            u = get_user_by_email(em) if EMAIL_RE.match(em) else None
+            if not u or (safe_bool_str(u.get("is_active", ""), True) != "TRUE"):
+                st.error("Usuario no existe o está inactivo.")
             else:
-                u = get_user_by_email(em)
-                if not u or (safe_bool_str(u.get("is_active", ""), True) != "TRUE"):
-                    st.error("Usuario no existe o está inactivo.")
+                stored = u.get("password_hash", "")
+                if not stored:
+                    st.error("Este usuario no tiene contraseña aún. Debe ingresar con código.")
+                elif pbkdf2_verify_password(password, stored, APP_PEPPER):
+                    u["last_login_at"] = iso(now_utc())
+                    upsert_user(u)
+                    set_auth(AuthUser(
+                        email=em,
+                        full_name=u.get("full_name", "") or em,
+                        is_admin=(safe_bool_str(u.get("is_admin", ""), False) == "TRUE")
+                    ))
+                    st.rerun()
                 else:
-                    stored = u.get("password_hash", "")
-                    if not stored:
-                        st.error("Este usuario no tiene contraseña aún. Debe ingresar con código.")
-                    elif pbkdf2_verify_password(password, stored, APP_PEPPER):
-                        u["last_login_at"] = iso(now_utc())
-                        upsert_user(u)
-                        set_auth(AuthUser(
-                            email=em,
-                            full_name=u.get("full_name", "") or em,
-                            is_admin=(safe_bool_str(u.get("is_admin", ""), False) == "TRUE")
-                        ))
-                        st.rerun()
-                    else:
-                        st.error("Contraseña incorrecta.")
+                    st.error("Contraseña incorrecta.")
 
     with c2:
         st.subheader("Primer acceso con código")
-        st.caption(f"Código temporal con vigencia de {INVITE_EXPIRY_HOURS} horas.")
         email2 = st.text_input("Email", key="invite_email", placeholder="usuario@empresa.com")
         code = st.text_input("Código (6 dígitos)", key="invite_code", max_chars=6)
-
         if st.button("Validar código", use_container_width=True):
             em = norm_email(email2)
-            if not EMAIL_RE.match(em):
-                st.error("Email inválido.")
-            elif not code or len(code.strip()) != 6:
-                st.error("Código inválido. Debe tener 6 dígitos.")
+            u = get_user_by_email(em) if EMAIL_RE.match(em) else None
+            if not u or (safe_bool_str(u.get("is_active", ""), True) != "TRUE"):
+                st.error("Usuario no existe o está inactivo.")
             else:
-                u = get_user_by_email(em)
-                if not u or (safe_bool_str(u.get("is_active", ""), True) != "TRUE"):
-                    st.error("Usuario no existe o está inactivo.")
+                inv = find_valid_invite(em, code.strip())
+                if not inv:
+                    st.error("Código incorrecto, vencido o ya usado.")
                 else:
-                    inv = find_valid_invite(em, code.strip())
-                    if not inv:
-                        st.error("Código incorrecto, vencido o ya usado.")
-                    else:
-                        st.session_state["pending_set_password_email"] = em
-                        st.session_state["pending_invite_created_at"] = inv.get("created_at", "")
-                        st.success("Código validado. Ahora define tu contraseña abajo.")
-                        st.rerun()
+                    st.session_state["pending_set_password_email"] = em
+                    st.session_state["pending_invite_created_at"] = inv.get("created_at", "")
+                    st.success("Código validado. Ahora define tu contraseña abajo.")
+                    st.rerun()
 
     pending_email = st.session_state.get("pending_set_password_email")
     if pending_email:
@@ -935,13 +898,14 @@ if not auth:
     st.stop()
 
 # =========================
-# MAIN
+# MAIN NAV
 # =========================
-st.sidebar.success(f"Conectado como: {auth.full_name} ({auth.email})")
+st.sidebar.success(f"Conectado: {auth.full_name}\n\n{auth.email}")
 if st.sidebar.button("Cerrar sesión"):
     clear_auth()
     st.rerun()
 
+# Build allowed communities for this user
 access = list_user_access(auth.email, include_inactive=False)
 comm_map = {c["community_id"]: c for c in list_communities(include_inactive=False)}
 
@@ -952,194 +916,229 @@ for a in access:
         allowed.append({
             "community_id": cid,
             "community_name": comm_map[cid].get("community_name", cid),
-            "role": (a.get("role", "") or "viewer").lower()
+            "role": (a.get("role", "") or "viewer").lower(),
+            "cover_link": comm_map[cid].get("cover_web_view_link", ""),
         })
 
+# Admin sees all communities
 if auth.is_admin:
     for cid, c in comm_map.items():
         if not any(x["community_id"] == cid for x in allowed):
-            allowed.append({"community_id": cid, "community_name": c.get("community_name", cid), "role": "admin"})
+            allowed.append({
+                "community_id": cid,
+                "community_name": c.get("community_name", cid),
+                "role": "admin",
+                "cover_link": c.get("cover_web_view_link", ""),
+            })
 
 allowed.sort(key=lambda x: x["community_name"])
 
-tab_ops, tab_master, tab_admin = st.tabs(
-    ["🧾 Operación (Checklist)", "🧱 Datos Maestros (Instalaciones)", "🧑‍💼 Administración"]
-)
+# ========= MODULES =========
+if auth.is_admin:
+    module = st.sidebar.radio("Módulos", ["🏘️ Comunidades", "🧑‍💼 Administrador"], index=0)
+else:
+    module = "🏘️ Comunidades"
 
 # =========================
-# Operación (Checklist + Fotos)
+# MODULE: Comunidades
 # =========================
-with tab_ops:
-    st.header("🧾 Checklist por comunidad")
+if module == "🏘️ Comunidades":
+    st.header("🏘️ Comunidades")
 
     if not allowed:
         st.warning("No tienes comunidades asignadas. Pide al admin que te otorgue acceso.")
-    else:
-        labels = [f"{x['community_name']} ({x['community_id']}) — rol: {x['role']}" for x in allowed]
-        idx = 0
-        current = st.session_state.get("selected_community_id")
-        if current:
-            for i, x in enumerate(allowed):
-                if x["community_id"] == current:
-                    idx = i
-                    break
+        st.stop()
 
-        sel = st.selectbox("Selecciona comunidad", options=list(range(len(allowed))), format_func=lambda i: labels[i], index=idx)
-        community_id = allowed[sel]["community_id"]
-        community_name = allowed[sel]["community_name"]
-        st.session_state["selected_community_id"] = community_id
+    # cards-like selector
+    st.caption("Selecciona una comunidad para elaborar o consultar informes.")
+    labels = [f"{x['community_name']} ({x['community_id']})" for x in allowed]
 
-        # report date + state
-        ctop1, ctop2 = st.columns([1, 1])
-        with ctop1:
-            check_date = st.date_input("Fecha del checklist", value=date.today())
-        with ctop2:
-            report_state = st.selectbox("Estado del informe", options=["Draft", "Final"], index=0)
+    default_idx = 0
+    if st.session_state.get("selected_community_id"):
+        for i, x in enumerate(allowed):
+            if x["community_id"] == st.session_state["selected_community_id"]:
+                default_idx = i
+                break
 
-        check_date_str = check_date.isoformat()
+    sel_i = st.selectbox("Comunidad", options=list(range(len(allowed))), format_func=lambda i: labels[i], index=default_idx)
+    sel_comm = allowed[sel_i]
+    community_id = sel_comm["community_id"]
+    community_name = sel_comm["community_name"]
+    role = sel_comm["role"]
+    st.session_state["selected_community_id"] = community_id
 
+    # header card
+    cover = sel_comm.get("cover_link", "")
+    left, right = st.columns([2.2, 1])
+    with left:
+        st.subheader(f"{community_name}")
+        st.caption(f"ID: {community_id} • Rol: {role}")
+    with right:
+        if cover:
+            st.markdown(f"[🖼️ Ver foto de comunidad en Drive]({cover})")
+        else:
+            st.caption("Sin foto de comunidad")
+
+    # Tabs inside a community
+    tab_work, tab_history = st.tabs(["🧾 Informe (Draft/Final)", "📚 Historial de informes"])
+
+    # ---- Work tab ----
+    with tab_work:
         inst_all = list_installations(community_id, include_inactive=True)
         if not inst_all:
-            if st.button("Precargar instalaciones sugeridas (opcional)"):
+            st.info("Esta comunidad aún no tiene instalaciones. (Admin debe definir o precargar instalaciones).")
+            if auth.is_admin and st.button("Precargar instalaciones sugeridas"):
                 seed_default_installations_if_empty(community_id)
                 st.success("Instalaciones precargadas.")
                 st.rerun()
+            st.stop()
 
         inst = list_installations(community_id, include_inactive=False)
         if not inst:
-            st.warning("Esta comunidad aún no tiene instalaciones activas. Ve a 'Datos Maestros'.")
-        else:
-            existing_map = get_check_rows_map(community_id, check_date_str, report_state)
+            st.warning("No hay instalaciones activas (puede que estén desactivadas).")
+            st.stop()
 
-            ok_n = sum(1 for i in inst if existing_map.get(i["installation_id"], {}).get("status") == "ok")
-            fail_n = sum(1 for i in inst if existing_map.get(i["installation_id"], {}).get("status") == "fail")
-            pend_n = len(inst) - ok_n - fail_n
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            check_date = st.date_input("Fecha", value=date.today())
+        with c2:
+            report_state = st.selectbox("Estado", options=["Draft", "Final"], index=0)
 
-            st.markdown(
-                f"""
-                <div style="display:flex; gap:12px; flex-wrap:wrap; margin-bottom:10px;">
-                  <div style="padding:12px 14px; border-radius:14px; border:1px solid #e2e8f0; min-width:160px;">
-                    <div style="font-size:12px; opacity:0.7;">OK</div>
-                    <div style="font-size:22px; font-weight:800; color:#16a34a;">{ok_n}</div>
-                  </div>
-                  <div style="padding:12px 14px; border-radius:14px; border:1px solid #e2e8f0; min-width:160px;">
-                    <div style="font-size:12px; opacity:0.7;">FALLAS</div>
-                    <div style="font-size:22px; font-weight:800; color:#dc2626;">{fail_n}</div>
-                  </div>
-                  <div style="padding:12px 14px; border-radius:14px; border:1px solid #e2e8f0; min-width:160px;">
-                    <div style="font-size:12px; opacity:0.7;">PENDIENTES</div>
-                    <div style="font-size:22px; font-weight:800; color:#64748b;">{pend_n}</div>
-                  </div>
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
+        check_date_str = check_date.isoformat()
+        existing_map = get_check_rows_map(community_id, check_date_str, report_state)
 
-            if not FOTOS_ROOT_FOLDER_ID:
-                st.warning("⚠️ Aún no está configurado FOTOS_ROOT_FOLDER_ID en secrets, las fotos no podrán subirse.")
+        ok_n = sum(1 for i in inst if existing_map.get(i["installation_id"], {}).get("status") == "ok")
+        fail_n = sum(1 for i in inst if existing_map.get(i["installation_id"], {}).get("status") == "fail")
+        pend_n = len(inst) - ok_n - fail_n
 
-            cats = sorted(
-                set([x.get("category", "") for x in inst]),
-                key=lambda s: (CATEGORIES_DEFAULT.index(s) if s in CATEGORIES_DEFAULT else 999, s)
-            )
+        st.markdown(
+            f"""
+            <div style="display:flex; gap:12px; flex-wrap:wrap; margin:8px 0 8px 0;">
+              <div style="padding:12px 14px; border-radius:14px; border:1px solid #e2e8f0; min-width:160px;">
+                <div style="font-size:12px; opacity:0.7;">OK</div>
+                <div style="font-size:22px; font-weight:800; color:#16a34a;">{ok_n}</div>
+              </div>
+              <div style="padding:12px 14px; border-radius:14px; border:1px solid #e2e8f0; min-width:160px;">
+                <div style="font-size:12px; opacity:0.7;">FALLAS</div>
+                <div style="font-size:22px; font-weight:800; color:#dc2626;">{fail_n}</div>
+              </div>
+              <div style="padding:12px 14px; border-radius:14px; border:1px solid #e2e8f0; min-width:160px;">
+                <div style="font-size:12px; opacity:0.7;">PENDIENTES</div>
+                <div style="font-size:22px; font-weight:800; color:#64748b;">{pend_n}</div>
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
 
-            for cat in cats:
-                st.subheader(cat)
-                rows_cat = [x for x in inst if x.get("category") == cat]
+        can_edit = (role in EDIT_ROLES)  # viewer => False
 
-                for item in rows_cat:
-                    iid = item["installation_id"]
-                    saved = existing_map.get(iid, {})
-                    cur_status = (saved.get("status") or "pending").lower()
-                    cur_note = saved.get("note") or ""
-                    photo_link = saved.get("photo_web_view_link") or ""
-                    photo_file_id = saved.get("photo_file_id") or ""
+        if not FOTOS_ROOT_FOLDER_ID:
+            st.warning("⚠️ FOTOS_ROOT_FOLDER_ID no está configurado: no podrás subir fotos.")
 
-                    bg = "#fee2e2" if cur_status == "fail" else "#ffffff"
+        cats = sorted(set([x.get("category", "") for x in inst]), key=lambda s: (CATEGORIES_DEFAULT.index(s) if s in CATEGORIES_DEFAULT else 999, s))
 
-                    with st.container(border=True):
-                        st.markdown(
-                            f"<div style='padding:8px 10px; border-radius:10px; background:{bg};'>"
-                            f"<div style='font-weight:800; font-size:16px;'>{item['installation_name']}</div>"
-                            f"</div>",
-                            unsafe_allow_html=True
+        for cat in cats:
+            st.subheader(cat)
+            rows_cat = [x for x in inst if x.get("category") == cat]
+
+            for item in rows_cat:
+                iid = item["installation_id"]
+                saved = existing_map.get(iid, {})
+                cur_status = (saved.get("status") or "pending").lower()
+                cur_note = saved.get("note") or ""
+                photo_link = saved.get("photo_web_view_link") or ""
+
+                bg = "#fee2e2" if cur_status == "fail" else "#ffffff"
+
+                with st.container(border=True):
+                    st.markdown(
+                        f"<div style='padding:8px 10px; border-radius:10px; background:{bg};'>"
+                        f"<div style='font-weight:800; font-size:16px;'>{item['installation_name']}</div>"
+                        f"</div>",
+                        unsafe_allow_html=True
+                    )
+
+                    colA, colB, colC = st.columns([1.2, 2.6, 2.2], gap="medium")
+
+                    with colA:
+                        status = st.radio(
+                            "Estado",
+                            options=["pending", "ok", "fail"],
+                            index=["pending", "ok", "fail"].index(cur_status if cur_status in ["pending", "ok", "fail"] else "pending"),
+                            format_func=lambda v: {"pending": "Pendiente", "ok": "OK", "fail": "Falla"}[v],
+                            key=f"st_{community_id}_{check_date_str}_{report_state}_{iid}",
+                            horizontal=True,
+                            label_visibility="collapsed",
+                            disabled=not can_edit
                         )
 
-                        colA, colB, colC = st.columns([1.2, 2.6, 2.2], gap="medium")
+                    with colB:
+                        note = st.text_input(
+                            "Observación",
+                            value=cur_note,
+                            placeholder="Observación breve…",
+                            key=f"nt_{community_id}_{check_date_str}_{report_state}_{iid}",
+                            label_visibility="collapsed",
+                            disabled=not can_edit
+                        )
 
-                        with colA:
-                            status = st.radio(
-                                "Estado",
-                                options=["pending", "ok", "fail"],
-                                index=["pending", "ok", "fail"].index(cur_status if cur_status in ["pending", "ok", "fail"] else "pending"),
-                                format_func=lambda v: {"pending": "Pendiente", "ok": "OK", "fail": "Falla"}[v],
-                                key=f"st_{community_id}_{check_date_str}_{report_state}_{iid}",
-                                horizontal=True,
-                                label_visibility="collapsed"
-                            )
+                    with colC:
+                        st.caption("📷 Registro visual (Drive)")
+                        if photo_link:
+                            st.markdown(f"✅ Foto guardada: [Abrir en Drive]({photo_link})")
+                        else:
+                            st.write("Sin foto vinculada.")
 
-                        with colB:
-                            note = st.text_input(
-                                "Observación",
-                                value=cur_note,
-                                placeholder="Observación breve…",
-                                key=f"nt_{community_id}_{check_date_str}_{report_state}_{iid}",
-                                label_visibility="collapsed"
-                            )
+                        up = st.file_uploader(
+                            "Subir foto",
+                            type=["jpg", "jpeg", "png"],
+                            key=f"ph_{community_id}_{check_date_str}_{report_state}_{iid}",
+                            label_visibility="collapsed",
+                            disabled=not can_edit
+                        )
 
-                        with colC:
-                            st.caption("📷 Registro visual (Drive)")
-                            up = st.file_uploader(
-                                "Subir foto",
-                                type=["jpg", "jpeg", "png"],
-                                key=f"ph_{community_id}_{check_date_str}_{report_state}_{iid}",
-                                label_visibility="collapsed"
-                            )
+                        if can_edit and photo_link:
+                            if st.button("Quitar vínculo (no borra en Drive)", key=f"rm_{community_id}_{check_date_str}_{report_state}_{iid}"):
+                                clear_photo_link(community_id, check_date_str, report_state, iid, auth.email)
+                                st.rerun()
 
-                            if photo_link:
-                                st.markdown(f"✅ Foto guardada: [Abrir en Drive]({photo_link})")
-                                if st.button("Quitar vínculo (no borra en Drive)", key=f"rm_{community_id}_{check_date_str}_{report_state}_{iid}"):
-                                    clear_photo_link(community_id, check_date_str, report_state, iid, auth.email)
+                        if can_edit and up is not None and FOTOS_ROOT_FOLDER_ID:
+                            if st.button("Subir a Drive y vincular", key=f"upl_{community_id}_{check_date_str}_{report_state}_{iid}"):
+                                try:
+                                    comm_folder = get_community_folder_id(community_id, community_name)
+                                    rep_folder = get_report_folder_id(comm_folder, check_date_str, report_state)
+                                    ins_folder = get_installation_folder_id(rep_folder, iid, item["installation_name"])
+
+                                    ext = up.type.split("/")[-1] if up.type and "/" in up.type else "jpg"
+                                    filename = f"{check_date_str}__{report_state}__{iid}.{ext}"
+
+                                    file_id, web_view = drive_upload_image_bytes(
+                                        parent_folder_id=ins_folder,
+                                        filename=filename,
+                                        content_type=up.type or "image/jpeg",
+                                        file_bytes=up.getvalue(),
+                                    )
+
+                                    upsert_check_row(
+                                        community_id=community_id,
+                                        check_date=check_date_str,
+                                        report_state=report_state,
+                                        inst=item,
+                                        status=status,
+                                        note=note,
+                                        updated_by=auth.email,
+                                        photo_file_id=file_id,
+                                        photo_web_view_link=web_view,
+                                    )
+                                    st.success("Foto subida y vinculada ✅")
                                     st.rerun()
-                            else:
-                                st.write("Sin foto vinculada.")
+                                except Exception as e:
+                                    st.error("No pude subir la foto a Drive.")
+                                    st.exception(e)
 
-                            if up is not None and FOTOS_ROOT_FOLDER_ID:
-                                if st.button("Subir a Drive y vincular", key=f"upl_{community_id}_{check_date_str}_{report_state}_{iid}"):
-                                    try:
-                                        comm_folder = get_community_folder_id(community_id, community_name)
-                                        rep_folder = get_report_folder_id(comm_folder, check_date_str, report_state)
-                                        ins_folder = get_installation_folder_id(rep_folder, iid, item["installation_name"])
-
-                                        ext = up.type.split("/")[-1] if up.type and "/" in up.type else "jpg"
-                                        filename = f"{check_date_str}__{report_state}__{iid}.{ext}"
-
-                                        file_id, web_view = drive_upload_image_bytes(
-                                            parent_folder_id=ins_folder,
-                                            filename=filename,
-                                            content_type=up.type or "image/jpeg",
-                                            file_bytes=up.getvalue(),
-                                        )
-
-                                        # upsert with photo fields
-                                        upsert_check_row(
-                                            community_id=community_id,
-                                            check_date=check_date_str,
-                                            report_state=report_state,
-                                            inst=item,
-                                            status=status,
-                                            note=note,
-                                            updated_by=auth.email,
-                                            photo_file_id=file_id,
-                                            photo_web_view_link=web_view,
-                                        )
-                                        st.success("Foto subida y vinculada ✅")
-                                        st.rerun()
-                                    except Exception as e:
-                                        st.error("No pude subir la foto a Drive.")
-                                        st.exception(e)
-
-                        # Persist status + note (sin tocar foto si no hay cambio)
+                    # Persist status + note (viewer no escribe)
+                    if can_edit:
                         upsert_check_row(
                             community_id=community_id,
                             check_date=check_date_str,
@@ -1148,221 +1147,271 @@ with tab_ops:
                             status=status,
                             note=note,
                             updated_by=auth.email,
-                            photo_file_id="",           # vacío => no sobrescribe
-                            photo_web_view_link="",     # vacío => no sobrescribe
+                            photo_file_id="",
+                            photo_web_view_link="",
                         )
+            st.divider()
 
-# =========================
-# Datos Maestros
-# =========================
-with tab_master:
-    st.header("🧱 Datos Maestros – Instalaciones por comunidad")
-
-    if not allowed:
-        st.warning("No tienes comunidades asignadas.")
-    else:
-        labels = [f"{x['community_name']} ({x['community_id']})" for x in allowed]
-        sel = st.selectbox("Comunidad", options=list(range(len(allowed))), format_func=lambda i: labels[i], index=0, key="master_comm")
-        community_id = allowed[sel]["community_id"]
-
-        st.subheader("Instalaciones activas")
-        inst = list_installations(community_id, include_inactive=False)
-        if inst:
+    # ---- History tab ----
+    with tab_history:
+        st.subheader("📚 Historial de informes")
+        items = list_report_dates_for_community(community_id)
+        if not items:
+            st.info("Aún no hay informes guardados para esta comunidad.")
+        else:
             st.dataframe(
-                [{"ID": x["installation_id"], "Categoría": x["category"], "Instalación": x["installation_name"]} for x in inst],
+                [{"Fecha": d, "Estado": s} for d, s in items],
                 use_container_width=True,
                 hide_index=True
             )
-        else:
-            st.info("No hay instalaciones activas para esta comunidad.")
-
-        with st.expander("➕ Agregar instalación"):
-            cat = st.selectbox("Categoría", options=CATEGORIES_DEFAULT + ["Otra"], index=0)
-            cat_other = ""
-            if cat == "Otra":
-                cat_other = st.text_input("Nombre categoría", placeholder="Ej: Seguridad")
-            name = st.text_input("Nombre instalación", placeholder="Ej: Bombas de agua / Portón norte")
-            if st.button("Agregar"):
-                category = cat_other.strip() if cat == "Otra" else cat
-                if not category:
-                    st.error("Indica una categoría.")
-                elif not name.strip():
-                    st.error("Indica el nombre de la instalación.")
-                else:
-                    add_installation(community_id, category, name.strip())
-                    st.success("Instalación agregada.")
-                    st.rerun()
-
-        with st.expander("🗑️ Desactivar/activar instalaciones"):
-            inst_all = list_installations(community_id, include_inactive=True)
-            if not inst_all:
-                st.write("No hay instalaciones.")
-            else:
-                for x in inst_all:
-                    active = (x["is_active"] == "TRUE")
-                    col1, col2, col3 = st.columns([4, 2, 2])
-                    with col1:
-                        st.write(f"**{x['installation_name']}** — {x['category']}  \n`{x['installation_id']}`")
-                    with col2:
-                        st.write("Activa ✅" if active else "Inactiva ⛔")
-                    with col3:
-                        if active:
-                            if st.button("Desactivar", key=f"deact_{x['installation_id']}"):
-                                set_installation_active(x["installation_id"], False)
-                                st.rerun()
-                        else:
-                            if st.button("Activar", key=f"act_{x['installation_id']}"):
-                                set_installation_active(x["installation_id"], True)
-                                st.rerun()
-
-        st.caption("Recomendación: no borrar, solo desactivar (mantiene historial).")
 
 # =========================
-# Administración
+# MODULE: Administrador
 # =========================
-with tab_admin:
+if module == "🧑‍💼 Administrador":
     st.header("🧑‍💼 Administración")
 
-    if not auth.is_admin:
-        st.info("Esta sección es solo para admins.")
-    else:
-        t_users, t_comms, t_access = st.tabs(["👤 Usuarios", "🏢 Comunidades", "🔐 Accesos"])
+    t_users, t_comms, t_install, t_access = st.tabs(["👤 Usuarios", "🏢 Comunidades", "🧱 Instalaciones", "🔐 Accesos"])
 
-        with t_users:
-            st.subheader("Usuarios")
-            _, users = read_table("Users")
-            users = sorted(users, key=lambda u: u.get("email", ""))
-            show = []
-            for u in users:
-                show.append({
-                    "Email": u.get("email", ""),
-                    "Nombre": u.get("full_name", ""),
-                    "Admin global": (safe_bool_str(u.get("is_admin", ""), False) == "TRUE"),
-                    "Activo": (safe_bool_str(u.get("is_active", ""), True) == "TRUE"),
-                    "Último login": u.get("last_login_at", ""),
-                })
-            st.dataframe(show, use_container_width=True, hide_index=True)
+    with t_users:
+        st.subheader("Usuarios")
+        _, users = read_table("Users")
+        users = sorted(users, key=lambda u: u.get("email", ""))
+        show = []
+        for u in users:
+            show.append({
+                "Email": u.get("email", ""),
+                "Nombre": u.get("full_name", ""),
+                "Admin global": (safe_bool_str(u.get("is_admin", ""), False) == "TRUE"),
+                "Activo": (safe_bool_str(u.get("is_active", ""), True) == "TRUE"),
+                "Último login": u.get("last_login_at", ""),
+            })
+        st.dataframe(show, use_container_width=True, hide_index=True)
 
-            st.markdown("#### Crear/actualizar usuario + generar código")
-            email = st.text_input("Email del usuario", key="admin_new_user_email", placeholder="persona@empresa.com")
-            full_name = st.text_input("Nombre completo", key="admin_new_user_name", placeholder="Juan Pérez")
-            is_admin_flag = st.checkbox("¿Es admin global?", value=False)
+        st.markdown("#### Crear/actualizar usuario + generar código")
+        email = st.text_input("Email del usuario", key="admin_new_user_email", placeholder="persona@empresa.com")
+        full_name = st.text_input("Nombre completo", key="admin_new_user_name", placeholder="Juan Pérez")
+        is_admin_flag = st.checkbox("¿Es admin global?", value=False)
 
-            comms = list_communities(include_inactive=False)
-            comm_choices = {f"{c['community_name']} ({c['community_id']})": c["community_id"] for c in comms}
-            selected_comm_labels = st.multiselect("Asignar a comunidades", options=list(comm_choices.keys()))
-            role = st.selectbox("Rol", options=ROLES, index=1)
+        comms = list_communities(include_inactive=False)
+        comm_choices = {f"{c['community_name']} ({c['community_id']})": c["community_id"] for c in comms}
+        selected_comm_labels = st.multiselect("Asignar a comunidades", options=list(comm_choices.keys()))
+        role = st.selectbox("Rol", options=ROLES, index=1)
 
-            if st.button("Crear/actualizar + generar código"):
-                em = norm_email(email)
-                if not EMAIL_RE.match(em):
-                    st.error("Email inválido.")
-                elif not full_name.strip():
-                    st.error("Indica nombre completo.")
+        if st.button("Crear/actualizar + generar código"):
+            em = norm_email(email)
+            if not EMAIL_RE.match(em):
+                st.error("Email inválido.")
+            elif not full_name.strip():
+                st.error("Indica nombre completo.")
+            else:
+                existing = get_user_by_email(em)
+                if not existing:
+                    u = {
+                        "user_id": f"USR-{secrets.token_hex(4)}",
+                        "email": em,
+                        "full_name": full_name.strip(),
+                        "is_admin": "TRUE" if is_admin_flag else "FALSE",
+                        "is_active": "TRUE",
+                        "password_hash": "",
+                        "created_at": iso(now_utc()),
+                        "last_login_at": "",
+                    }
                 else:
-                    existing = get_user_by_email(em)
-                    if not existing:
-                        u = {
-                            "user_id": f"USR-{secrets.token_hex(4)}",
-                            "email": em,
-                            "full_name": full_name.strip(),
-                            "is_admin": "TRUE" if is_admin_flag else "FALSE",
-                            "is_active": "TRUE",
-                            "password_hash": "",
-                            "created_at": iso(now_utc()),
-                            "last_login_at": "",
-                        }
+                    u = existing
+                    u["full_name"] = full_name.strip()
+                    u["is_admin"] = "TRUE" if is_admin_flag else "FALSE"
+                    u["is_active"] = "TRUE"
+
+                upsert_user(u)
+
+                for lbl in selected_comm_labels:
+                    cid = comm_choices[lbl]
+                    grant_access(em, cid, role)
+
+                code = generate_invite(em, auth.email)
+                st.success("Usuario listo. Copia el código y envíaselo.")
+                st.code(f"Código para {em}: {code}", language="text")
+
+    with t_comms:
+        st.subheader("Comunidades")
+
+        name = st.text_input("Nueva comunidad", placeholder="Ej: Edificio A - Los Castaños")
+        if st.button("Crear comunidad"):
+            if not name.strip():
+                st.error("Indica un nombre.")
+            else:
+                row = create_community(name.strip())
+                st.success(f"Comunidad creada: {row['community_name']} ({row['community_id']})")
+                # (Opcional) asignar acceso explícito al creador
+                grant_access(auth.email, row["community_id"], "admin")
+                st.rerun()
+
+        st.markdown("#### Todas las comunidades")
+        comms_all = list_communities(include_inactive=True)
+        if not comms_all:
+            st.write("No hay comunidades.")
+        else:
+            for c in comms_all:
+                active = (safe_bool_str(c.get("is_active", ""), True) == "TRUE")
+                col1, col2, col3, col4 = st.columns([4, 1.2, 1.4, 2.4])
+                with col1:
+                    st.write(f"**{c['community_name']}**  \n`{c['community_id']}`")
+                    cover_link = c.get("cover_web_view_link", "")
+                    if cover_link:
+                        st.markdown(f"[🖼️ Foto]({cover_link})")
+                with col2:
+                    st.write("✅" if active else "⛔")
+                with col3:
+                    if active:
+                        if st.button("Desactivar", key=f"del_{c['community_id']}"):
+                            set_community_active(c["community_id"], False)
+                            st.rerun()
                     else:
-                        u = existing
-                        u["full_name"] = full_name.strip()
-                        u["is_admin"] = "TRUE" if is_admin_flag else "FALSE"
-                        u["is_active"] = "TRUE"
+                        if st.button("Reactivar", key=f"rea_{c['community_id']}"):
+                            set_community_active(c["community_id"], True)
+                            st.rerun()
+                with col4:
+                    # optional cover photo upload
+                    st.caption("Foto opcional de comunidad (Drive)")
+                    up = st.file_uploader(
+                        "Subir portada",
+                        type=["jpg", "jpeg", "png"],
+                        key=f"cover_{c['community_id']}",
+                        label_visibility="collapsed"
+                    )
+                    if up is not None:
+                        if not FOTOS_ROOT_FOLDER_ID:
+                            st.error("Falta FOTOS_ROOT_FOLDER_ID en secrets.")
+                        else:
+                            if st.button("Guardar portada", key=f"save_cover_{c['community_id']}"):
+                                try:
+                                    # store in a stable folder: /COM__Name/_cover
+                                    comm_folder = get_community_folder_id(c["community_id"], c["community_name"])
+                                    cover_folder = drive_get_or_create_folder(comm_folder, "_cover")
+                                    ext = up.type.split("/")[-1] if up.type and "/" in up.type else "jpg"
+                                    filename = f"cover.{ext}"
+                                    file_id, web_view = drive_upload_image_bytes(
+                                        parent_folder_id=cover_folder,
+                                        filename=filename,
+                                        content_type=up.type or "image/jpeg",
+                                        file_bytes=up.getvalue(),
+                                    )
+                                    update_community_cover(c["community_id"], file_id, web_view)
+                                    st.success("Portada guardada ✅")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error("No pude guardar la portada.")
+                                    st.exception(e)
 
-                    upsert_user(u)
+        st.caption("Recomendación: desactivar en vez de borrar (mantiene histórico).")
 
-                    for lbl in selected_comm_labels:
-                        cid = comm_choices[lbl]
-                        grant_access(em, cid, role)
+    with t_install:
+        st.subheader("Instalaciones por comunidad")
+        comms = list_communities(include_inactive=False)
+        if not comms:
+            st.warning("Primero crea una comunidad.")
+        else:
+            comm_labels = [f"{c['community_name']} ({c['community_id']})" for c in comms]
+            idx = st.selectbox("Comunidad", options=list(range(len(comms))), format_func=lambda i: comm_labels[i], index=0)
+            cid = comms[idx]["community_id"]
 
-                    code = generate_invite(em, auth.email)
-                    st.success("Usuario listo. Copia el código y envíaselo.")
-                    st.code(f"Código para {em}: {code}", language="text")
+            st.markdown("##### Instalaciones activas")
+            inst = list_installations(cid, include_inactive=False)
+            if inst:
+                st.dataframe(
+                    [{"ID": x["installation_id"], "Categoría": x["category"], "Instalación": x["installation_name"]} for x in inst],
+                    use_container_width=True,
+                    hide_index=True
+                )
+            else:
+                st.info("No hay instalaciones activas.")
 
-        with t_comms:
-            st.subheader("Comunidades")
-            name = st.text_input("Nueva comunidad", placeholder="Ej: Edificio A - Los Castaños")
-            if st.button("Crear comunidad"):
-                if not name.strip():
-                    st.error("Indica un nombre.")
+            colA, colB = st.columns([1, 1])
+            with colA:
+                if st.button("Precargar instalaciones sugeridas"):
+                    seed_default_installations_if_empty(cid)
+                    st.success("Instalaciones precargadas.")
+                    st.rerun()
+            with colB:
+                st.caption("Puedes desactivar instalaciones sin perder historial.")
+
+            with st.expander("➕ Agregar instalación"):
+                cat = st.selectbox("Categoría", options=CATEGORIES_DEFAULT + ["Otra"], index=0, key="cat_add")
+                cat_other = ""
+                if cat == "Otra":
+                    cat_other = st.text_input("Nombre categoría", placeholder="Ej: Seguridad")
+                name = st.text_input("Nombre instalación", placeholder="Ej: Portón norte")
+                if st.button("Agregar"):
+                    category = cat_other.strip() if cat == "Otra" else cat
+                    if not category:
+                        st.error("Indica una categoría.")
+                    elif not name.strip():
+                        st.error("Indica el nombre de la instalación.")
+                    else:
+                        add_installation(cid, category, name.strip())
+                        st.success("Instalación agregada.")
+                        st.rerun()
+
+            with st.expander("🗑️ Desactivar/activar instalaciones"):
+                inst_all = list_installations(cid, include_inactive=True)
+                if not inst_all:
+                    st.write("No hay instalaciones.")
                 else:
-                    row = create_community(name.strip())
-                    st.success(f"Comunidad creada: {row['community_name']} ({row['community_id']})")
+                    for x in inst_all:
+                        active = (x["is_active"] == "TRUE")
+                        c1, c2, c3 = st.columns([4, 2, 2])
+                        with c1:
+                            st.write(f"**{x['installation_name']}** — {x['category']}  \n`{x['installation_id']}`")
+                        with c2:
+                            st.write("Activa ✅" if active else "Inactiva ⛔")
+                        with c3:
+                            if active:
+                                if st.button("Desactivar", key=f"deact_{x['installation_id']}"):
+                                    set_installation_active(x["installation_id"], False)
+                                    st.rerun()
+                            else:
+                                if st.button("Activar", key=f"act_{x['installation_id']}"):
+                                    set_installation_active(x["installation_id"], True)
+                                    st.rerun()
+
+    with t_access:
+        st.subheader("Accesos")
+        _, users = read_table("Users")
+        users_active = [u for u in users if safe_bool_str(u.get("is_active", ""), True) == "TRUE" and u.get("email")]
+        users_active = sorted(users_active, key=lambda u: u.get("email", ""))
+        user_emails = [u["email"] for u in users_active]
+
+        comms = list_communities(include_inactive=False)
+        comm_choices = {f"{c['community_name']} ({c['community_id']})": c["community_id"] for c in comms}
+
+        if not user_emails:
+            st.warning("No hay usuarios activos.")
+        elif not comm_choices:
+            st.warning("No hay comunidades activas.")
+        else:
+            target = st.selectbox("Usuario", options=user_emails)
+            st.markdown("##### Accesos actuales del usuario")
+            cur = list_user_access(target, include_inactive=True)
+            if cur:
+                st.dataframe(cur, use_container_width=True, hide_index=True)
+            else:
+                st.write("Sin accesos.")
+
+            st.markdown("##### Otorgar / revocar")
+            comm_label = st.selectbox("Comunidad", options=list(comm_choices.keys()))
+            role = st.selectbox("Rol", options=ROLES, index=1, key="role_access")
+
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("Guardar acceso"):
+                    grant_access(target, comm_choices[comm_label], role)
+                    st.success("Acceso actualizado.")
+                    st.rerun()
+            with col2:
+                if st.button("Revocar acceso"):
+                    revoke_access(target, comm_choices[comm_label])
+                    st.success("Acceso revocado.")
                     st.rerun()
 
-            st.markdown("#### Todas las comunidades")
-            comms_all = list_communities(include_inactive=True)
-            if not comms_all:
-                st.write("No hay comunidades.")
-            else:
-                for c in comms_all:
-                    active = (c["is_active"] == "TRUE")
-                    col1, col2, col3 = st.columns([5, 2, 2])
-                    with col1:
-                        st.write(f"**{c['community_name']}**  \n`{c['community_id']}`")
-                    with col2:
-                        st.write("Activa ✅" if active else "Inactiva ⛔")
-                    with col3:
-                        if active:
-                            if st.button("Eliminar (desactivar)", key=f"del_{c['community_id']}"):
-                                set_community_active(c["community_id"], False)
-                                st.rerun()
-                        else:
-                            if st.button("Reactivar", key=f"rea_{c['community_id']}"):
-                                set_community_active(c["community_id"], True)
-                                st.rerun()
-
-            st.caption("Se recomienda desactivar en vez de borrar, para mantener histórico.")
-
-        with t_access:
-            st.subheader("Accesos")
-            _, users = read_table("Users")
-            users_active = [u for u in users if safe_bool_str(u.get("is_active", ""), True) == "TRUE" and u.get("email")]
-            users_active = sorted(users_active, key=lambda u: u.get("email", ""))
-            user_emails = [u["email"] for u in users_active]
-
-            comms = list_communities(include_inactive=False)
-            comm_choices = {f"{c['community_name']} ({c['community_id']})": c["community_id"] for c in comms}
-
-            if not user_emails:
-                st.warning("No hay usuarios activos.")
-            else:
-                target = st.selectbox("Usuario", options=user_emails)
-                st.markdown("##### Accesos actuales del usuario")
-                cur = list_user_access(target, include_inactive=True)
-                if cur:
-                    st.dataframe(cur, use_container_width=True, hide_index=True)
-                else:
-                    st.write("Sin accesos.")
-
-                st.markdown("##### Otorgar / revocar")
-                if not comm_choices:
-                    st.warning("Crea al menos una comunidad activa.")
-                else:
-                    comm_label = st.selectbox("Comunidad", options=list(comm_choices.keys()))
-                    role = st.selectbox("Rol", options=ROLES, index=1, key="role_access")
-
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        if st.button("Guardar acceso"):
-                            grant_access(target, comm_choices[comm_label], role)
-                            st.success("Acceso actualizado.")
-                            st.rerun()
-                    with col2:
-                        if st.button("Revocar acceso"):
-                            revoke_access(target, comm_choices[comm_label])
-                            st.success("Acceso revocado.")
-                            st.rerun()
-
-st.caption("Fotos persistentes en Drive ✅  •  Próximo paso: export PDF/Word con tabla por áreas + fotos.")
-
-
+st.caption("✅ Módulo Comunidades (roles) + Admin (configuración). Próximo: export PDF/Word con fotos.")
