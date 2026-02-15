@@ -1415,3 +1415,4 @@ if module == "🧑‍💼 Administrador":
                     st.rerun()
 
 st.caption("✅ Módulo Comunidades (roles) + Admin (configuración). Próximo: export PDF/Word con fotos.")
+
