@@ -3,13 +3,14 @@ import hmac
 import base64
 import hashlib
 import secrets
+import requests
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 import streamlit as st
 from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
+from google.auth.transport.requests import AuthorizedSession
 
 # =========================
 # App Config
@@ -36,21 +37,17 @@ ACCESS_HEADERS = [
 ROLES = ["admin", "supervisor", "conserje", "viewer"]
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
-
 # =========================
 # Basic helpers
 # =========================
 def norm_email(email: str) -> str:
     return (email or "").strip().lower()
 
-
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
-
 def iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat()
-
 
 def parse_iso(s: str) -> Optional[datetime]:
     if not s:
@@ -62,7 +59,6 @@ def parse_iso(s: str) -> Optional[datetime]:
         return dt.astimezone(timezone.utc)
     except Exception:
         return None
-
 
 # =========================
 # Secrets
@@ -77,9 +73,8 @@ BOOTSTRAP_ADMIN_EMAILS = [
 INVITE_EXPIRY_HOURS = int(str(st.secrets.get("INVITE_EXPIRY_HOURS", "48")))
 BOOTSTRAP_SETUP_TOKEN = str(st.secrets.get("BOOTSTRAP_SETUP_TOKEN", ""))
 
-
 # =========================
-# Google API (Service Account - MODO B)
+# Google Sheets via AuthorizedSession (NO googleapiclient/httplib2)
 # =========================
 @st.cache_resource
 def get_creds():
@@ -92,7 +87,10 @@ def get_creds():
         "client_id": st.secrets["GCP_CLIENT_ID"],
         "auth_uri": st.secrets.get("GCP_AUTH_URI", "https://accounts.google.com/o/oauth2/auth"),
         "token_uri": st.secrets.get("GCP_TOKEN_URI", "https://oauth2.googleapis.com/token"),
-        "auth_provider_x509_cert_url": st.secrets.get("GCP_AUTH_PROVIDER_X509_CERT_URL", "https://www.googleapis.com/oauth2/v1/certs"),
+        "auth_provider_x509_cert_url": st.secrets.get(
+            "GCP_AUTH_PROVIDER_X509_CERT_URL",
+            "https://www.googleapis.com/oauth2/v1/certs",
+        ),
         "client_x509_cert_url": st.secrets["GCP_CLIENT_X509_CERT_URL"],
     }
     scopes = [
@@ -101,11 +99,53 @@ def get_creds():
     ]
     return Credentials.from_service_account_info(info, scopes=scopes)
 
-
 @st.cache_resource
-def sheets_service():
-    return build("sheets", "v4", credentials=get_creds())
+def authed_session() -> AuthorizedSession:
+    return AuthorizedSession(get_creds())
 
+def _gs_url(path: str) -> str:
+    return "https://sheets.googleapis.com" + path
+
+def _gs_request(method: str, url: str, *, params=None, json_body=None, timeout=30) -> dict:
+    sess = authed_session()
+    resp = sess.request(method, url, params=params, json=json_body, timeout=timeout)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Google Sheets API error {resp.status_code}: {resp.text}")
+    return resp.json() if resp.text else {}
+
+def sheets_get(spreadsheet_id: str) -> dict:
+    return _gs_request("GET", _gs_url(f"/v4/spreadsheets/{spreadsheet_id}"))
+
+def sheets_values_get(range_a1: str) -> List[List[str]]:
+    # encode A1 range safely
+    enc = requests.utils.quote(range_a1, safe="")
+    data = _gs_request("GET", _gs_url(f"/v4/spreadsheets/{SHEET_ID}/values/{enc}"))
+    return data.get("values", [])
+
+def sheets_values_update(range_a1: str, values: List[List[str]]):
+    enc = requests.utils.quote(range_a1, safe="")
+    _gs_request(
+        "PUT",
+        _gs_url(f"/v4/spreadsheets/{SHEET_ID}/values/{enc}"),
+        params={"valueInputOption": "RAW"},
+        json_body={"range": range_a1, "majorDimension": "ROWS", "values": values},
+    )
+
+def sheets_values_append(range_a1: str, values: List[List[str]]):
+    enc = requests.utils.quote(range_a1, safe="")
+    _gs_request(
+        "POST",
+        _gs_url(f"/v4/spreadsheets/{SHEET_ID}/values/{enc}:append"),
+        params={"valueInputOption": "RAW", "insertDataOption": "INSERT_ROWS"},
+        json_body={"range": range_a1, "majorDimension": "ROWS", "values": values},
+    )
+
+def sheets_batch_update(spreadsheet_id: str, reqs: List[dict]):
+    _gs_request(
+        "POST",
+        _gs_url(f"/v4/spreadsheets/{spreadsheet_id}:batchUpdate"),
+        json_body={"requests": reqs},
+    )
 
 # =========================
 # Password & Invite hashing (stdlib only)
@@ -119,7 +159,6 @@ def pbkdf2_hash_password(password: str, pepper: str, iterations: int = 210_000) 
         base64.urlsafe_b64encode(salt).decode("utf-8"),
         base64.urlsafe_b64encode(dk).decode("utf-8"),
     )
-
 
 def pbkdf2_verify_password(password: str, stored: str, pepper: str) -> bool:
     try:
@@ -135,11 +174,9 @@ def pbkdf2_verify_password(password: str, stored: str, pepper: str) -> bool:
     except Exception:
         return False
 
-
 def hash_invite_code(code: str, pepper: str) -> str:
     h = hashlib.sha256((code + pepper).encode("utf-8")).hexdigest()
     return f"sha256${h}"
-
 
 def verify_invite_code(code: str, stored: str, pepper: str) -> bool:
     try:
@@ -151,55 +188,20 @@ def verify_invite_code(code: str, stored: str, pepper: str) -> bool:
     except Exception:
         return False
 
-
 # =========================
-# Sheets helpers
+# Schema & Tables
 # =========================
-def sheets_get(spreadsheet_id: str):
-    return sheets_service().spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-
-
-def sheets_values_get(range_a1: str) -> List[List[str]]:
-    resp = sheets_service().spreadsheets().values().get(
-        spreadsheetId=SHEET_ID,
-        range=range_a1,
-        valueRenderOption="UNFORMATTED_VALUE",
-    ).execute()
-    return resp.get("values", [])
-
-
-def sheets_values_update(range_a1: str, values: List[List[str]]):
-    sheets_service().spreadsheets().values().update(
-        spreadsheetId=SHEET_ID,
-        range=range_a1,
-        valueInputOption="RAW",
-        body={"values": values},
-    ).execute()
-
-
-def sheets_values_append(range_a1: str, values: List[List[str]]):
-    sheets_service().spreadsheets().values().append(
-        spreadsheetId=SHEET_ID,
-        range=range_a1,
-        valueInputOption="RAW",
-        insertDataOption="INSERT_ROWS",
-        body={"values": values},
-    ).execute()
-
-
 def ensure_sheet_tabs_and_headers():
     meta = sheets_get(SHEET_ID)
     existing = {s["properties"]["title"] for s in meta.get("sheets", [])}
 
-    requests = []
+    reqs = []
     for title in REQUIRED_TABS:
         if title not in existing:
-            requests.append({"addSheet": {"properties": {"title": title}}})
+            reqs.append({"addSheet": {"properties": {"title": title}}})
 
-    if requests:
-        sheets_service().spreadsheets().batchUpdate(
-            spreadsheetId=SHEET_ID, body={"requests": requests}
-        ).execute()
+    if reqs:
+        sheets_batch_update(SHEET_ID, reqs)
 
     def ensure_headers(tab: str, headers: List[str]):
         vals = sheets_values_get(f"{tab}!A1:Z1")
@@ -215,30 +217,29 @@ def ensure_sheet_tabs_and_headers():
     ensure_headers("Communities", COMM_HEADERS)
     ensure_headers("UserCommunityAccess", ACCESS_HEADERS)
 
-
 def read_table(tab: str) -> Tuple[List[str], List[Dict[str, str]]]:
     values = sheets_values_get(f"{tab}!A1:Z")
     if not values:
         return [], []
     headers = [str(x).strip() for x in values[0]]
-    rows = []
+    rows: List[Dict[str, str]] = []
     for r in values[1:]:
-        d = {}
+        d: Dict[str, str] = {}
         for i, h in enumerate(headers):
             d[h] = str(r[i]).strip() if i < len(r) and r[i] is not None else ""
-        rows.append(d)
+        # ignore fully empty rows
+        if any(v != "" for v in d.values()):
+            rows.append(d)
     return headers, rows
 
-
 def write_table(tab: str, headers: List[str], rows: List[Dict[str, str]]):
-    out = [headers]
+    out: List[List[str]] = [headers]
     for d in rows:
         out.append([d.get(h, "") for h in headers])
     sheets_values_update(f"{tab}!A1", out)
 
-
 # =========================
-# Data layer ops
+# Data ops
 # =========================
 def bootstrap_admin_users():
     _, users = read_table("Users")
@@ -268,7 +269,6 @@ def bootstrap_admin_users():
     if changed:
         write_table("Users", USERS_HEADERS, users)
 
-
 def get_user_by_email(email: str) -> Optional[Dict[str, str]]:
     _, users = read_table("Users")
     em = norm_email(email)
@@ -276,7 +276,6 @@ def get_user_by_email(email: str) -> Optional[Dict[str, str]]:
         if norm_email(u.get("email", "")) == em:
             return u
     return None
-
 
 def upsert_user(user: Dict[str, str]):
     _, users = read_table("Users")
@@ -290,7 +289,6 @@ def upsert_user(user: Dict[str, str]):
     if not found:
         users.append(user)
     write_table("Users", USERS_HEADERS, users)
-
 
 def generate_invite(email: str, created_by: str) -> str:
     code = "".join(str(secrets.randbelow(10)) for _ in range(6))
@@ -307,7 +305,6 @@ def generate_invite(email: str, created_by: str) -> str:
     sheets_values_append("Invites!A1", [[invite_row.get(h, "") for h in INVITES_HEADERS]])
     return code
 
-
 def find_valid_invite(email: str, code: str) -> Optional[Dict[str, str]]:
     _, invites = read_table("Invites")
     em = norm_email(email)
@@ -323,7 +320,6 @@ def find_valid_invite(email: str, code: str) -> Optional[Dict[str, str]]:
             return inv
     return None
 
-
 def mark_invite_used(invite: Dict[str, str]):
     _, invites = read_table("Invites")
     em = norm_email(invite.get("email", ""))
@@ -334,7 +330,6 @@ def mark_invite_used(invite: Dict[str, str]):
             break
     write_table("Invites", INVITES_HEADERS, invites)
 
-
 def list_communities() -> List[Dict[str, str]]:
     _, comms = read_table("Communities")
     out = []
@@ -342,7 +337,6 @@ def list_communities() -> List[Dict[str, str]]:
         if (c.get("is_active", "").upper() or "TRUE") == "TRUE" and c.get("community_id"):
             out.append(c)
     return out
-
 
 def create_community(name: str) -> Dict[str, str]:
     name = name.strip()
@@ -360,7 +354,6 @@ def create_community(name: str) -> Dict[str, str]:
     sheets_values_append("Communities!A1", [[row.get(h, "") for h in COMM_HEADERS]])
     return row
 
-
 def list_user_access(email: str) -> List[Dict[str, str]]:
     _, rows = read_table("UserCommunityAccess")
     em = norm_email(email)
@@ -369,7 +362,6 @@ def list_user_access(email: str) -> List[Dict[str, str]]:
         if norm_email(r.get("email", "")) == em and (r.get("is_active", "").upper() or "TRUE") == "TRUE":
             out.append(r)
     return out
-
 
 def grant_access(email: str, community_id: str, role: str):
     _, rows = read_table("UserCommunityAccess")
@@ -391,7 +383,6 @@ def grant_access(email: str, community_id: str, role: str):
 
     write_table("UserCommunityAccess", ACCESS_HEADERS, rows)
 
-
 def revoke_access(email: str, community_id: str):
     _, rows = read_table("UserCommunityAccess")
     em = norm_email(email)
@@ -400,7 +391,6 @@ def revoke_access(email: str, community_id: str):
             rows[i]["is_active"] = "FALSE"
             break
     write_table("UserCommunityAccess", ACCESS_HEADERS, rows)
-
 
 # =========================
 # Session auth
@@ -411,10 +401,8 @@ class AuthUser:
     full_name: str
     is_admin: bool
 
-
 def set_auth(user: AuthUser):
     st.session_state["auth"] = {"email": user.email, "full_name": user.full_name, "is_admin": user.is_admin}
-
 
 def get_auth() -> Optional[AuthUser]:
     d = st.session_state.get("auth")
@@ -422,24 +410,27 @@ def get_auth() -> Optional[AuthUser]:
         return None
     return AuthUser(email=d["email"], full_name=d.get("full_name", ""), is_admin=bool(d.get("is_admin")))
 
-
 def clear_auth():
     st.session_state.pop("auth", None)
     st.session_state.pop("selected_community_id", None)
 
-
 # =========================
 # Boot (ensure schema + bootstrap admins)
 # =========================
-ensure_sheet_tabs_and_headers()
-bootstrap_admin_users()
+try:
+    ensure_sheet_tabs_and_headers()
+    bootstrap_admin_users()
+except Exception as e:
+    st.error("No pude inicializar la estructura del Google Sheet.")
+    st.exception(e)
+    st.stop()
 
 auth = get_auth()
 
 # =========================
 # UI - Login
 # =========================
-st.title("🛡️ Control Edificio Pro — Acceso")
+st.title("🛡️ Control Comunidades — Acceso")
 
 st.info(
     "Formas de ingreso:\n"
@@ -451,7 +442,7 @@ st.info(
 if not auth:
     # ---- Secure bootstrap activation (no codes generated) ----
     with st.expander("🧰 Activación inicial (solo admins bootstrap)"):
-        st.caption("Esto solo se usa una vez para el primer ingreso del admin inicial. Requiere token secreto (definido en Secrets).")
+        st.caption("Úsalo solo una vez para activar al primer admin. No genera códigos, solo define contraseña con token secreto.")
 
         b_email = st.text_input("Email admin bootstrap", placeholder="bnbpartnerscommunity@gmail.com")
         b_token = st.text_input("Token secreto", type="password", placeholder="(definido en Secrets)")
@@ -478,8 +469,7 @@ if not auth:
                     u["password_hash"] = pbkdf2_hash_password(b_pass1, APP_PEPPER)
                     u["last_login_at"] = iso(now_utc())
                     upsert_user(u)
-                    st.success("Admin activado. Ahora puedes ingresar con contraseña.")
-                    st.info("Ve a 'Ingreso con contraseña' con tu email y la contraseña que definiste.")
+                    st.success("Admin activado. Ahora puedes ingresar con contraseña (panel izquierdo).")
 
     # ---- Normal login / invite flow ----
     c1, c2 = st.columns([1.05, 1], gap="large")
@@ -626,7 +616,7 @@ else:
                 break
     sel = st.selectbox("Selecciona comunidad", options=list(range(len(allowed))), format_func=lambda i: labels[i], index=idx)
     st.session_state["selected_community_id"] = allowed[sel]["community_id"]
-    st.info("✅ Listo. Próximo paso: Reportes Draft/Final + checklist por comunidad + fotos en Drive.")
+    st.info("✅ Listo. (En el próximo paso iremos con Reportes Draft/Final + checklist por comunidad + fotos en Drive).")
 
 # ---- Admin Panel ----
 if auth.is_admin:
@@ -720,19 +710,23 @@ if auth.is_admin:
             st.markdown("##### Otorgar o actualizar acceso")
             comms = list_communities()
             comm_choices = {f"{c['community_name']} ({c['community_id']})": c["community_id"] for c in comms}
-            comm_label = st.selectbox("Comunidad", options=list(comm_choices.keys()))
-            role = st.selectbox("Rol", options=ROLES, index=1)
+            if not comm_choices:
+                st.warning("Crea al menos una comunidad primero.")
+            else:
+                comm_label = st.selectbox("Comunidad", options=list(comm_choices.keys()))
+                role = st.selectbox("Rol", options=ROLES, index=1)
 
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("Guardar acceso"):
-                    grant_access(target, comm_choices[comm_label], role)
-                    st.success("Acceso actualizado.")
-                    st.rerun()
-            with col2:
-                if st.button("Revocar acceso"):
-                    revoke_access(target, comm_choices[comm_label])
-                    st.success("Acceso revocado.")
-                    st.rerun()
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button("Guardar acceso"):
+                        grant_access(target, comm_choices[comm_label], role)
+                        st.success("Acceso actualizado.")
+                        st.rerun()
+                with col2:
+                    if st.button("Revocar acceso"):
+                        revoke_access(target, comm_choices[comm_label])
+                        st.success("Acceso revocado.")
+                        st.rerun()
 
-st.caption("MVP: Auth seguro (bootstrap por token) + invitaciones por admin + comunidades y accesos en Sheets.")
+st.caption("MVP: Auth seguro (bootstrap por token) + invitaciones por admin + comunidades y accesos en Google Sheets.")
+
