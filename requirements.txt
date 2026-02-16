@@ -1,8 +1,11 @@
 streamlit==1.42.2
-google-auth==2.36.0
 requests==2.32.3
 pandas==2.2.3
 openpyxl==3.1.5
 reportlab>=4.0
 python-docx>=1.1.2
 cryptography>=42.0.0
+google-api-python-client==2.141.0
+google-auth==2.33.0
+google-auth-httplib2==0.2.0
+google-auth-oauthlib==1.2.1
