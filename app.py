@@ -1,943 +1,871 @@
 # app.py
-# -*- coding: utf-8 -*-
-"""
-Control Comunidades • Sheets (Service Account) + Drive (OAuth Mi Unidad)
-- Usuarios/roles/comunidades en Google Sheets
-- Fotos privadas en Drive (Mi Unidad) usando OAuth conectado SOLO por admin
-- Informe Draft/Final
-- Exporta PDF visual (3 columnas: categoría/instalación/tarea | estado+obs | foto)
-- Guarda PDF final en Drive y registra el file_id en Sheets
-"""
-
-from __future__ import annotations
+# ============================================================
+# 🛡️ Control Comunidades — Informes con Sheets + Export PDF/Word
+#    - Sheets (Service Account) = Base de datos
+#    - Drive (OAuth) = Guardar PDFs/DOCX en "Mi unidad" del admin
+# ============================================================
 
 import base64
 import hashlib
 import io
 import json
-import secrets
+import os
+import re
 import time
+import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timedelta, date
+from typing import Dict, List, Optional, Tuple
 
-import requests
+import pandas as pd
 import streamlit as st
+from PIL import Image
 
-# PDF
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
+from google_auth_oauthlib.flow import Flow
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
+
+# Report exports
 from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import mm
 from reportlab.lib import colors
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image as RLImage
+from reportlab.lib.units import mm
 from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage
+from reportlab.lib.enums import TA_LEFT
+from reportlab.lib.styles import ParagraphStyle
 
-# Crypto (token OAuth cifrado en Sheets)
-from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
-from cryptography.hazmat.backends import default_backend
-from cryptography.fernet import Fernet
-
-# Google Auth for Service Account -> access token (Sheets)
-from google.oauth2.service_account import Credentials as SACredentials
+from docx import Document
+from docx.shared import Inches
 
 
-# -------------------------
-# Config / Secrets
-# -------------------------
+# ============================================================
+# CONFIG
+# ============================================================
+
 st.set_page_config(page_title="Control Comunidades", page_icon="🛡️", layout="wide")
 
-REQUIRED_SECRETS = [
-    "GCP_SERVICE_ACCOUNT",
-    "SHEET_ID",
-    "APP_PEPPER",
-    "BOOTSTRAP_ADMIN_EMAILS",
-    "OAUTH_CLIENT_ID",
-    "OAUTH_CLIENT_SECRET",
-    "OAUTH_REDIRECT_URI",
-]
-missing = [k for k in REQUIRED_SECRETS if k not in st.secrets]
-if missing:
-    st.error(f"Faltan secrets: {', '.join(missing)}")
-    st.stop()
+APP_NAME = "🛡️ Control Comunidades"
+NOW = lambda: datetime.now()
 
-SHEET_ID = st.secrets["SHEET_ID"]
-APP_PEPPER = st.secrets["APP_PEPPER"]
-BOOTSTRAP_ADMIN_EMAILS = set(
-    x.strip().lower()
-    for x in st.secrets["BOOTSTRAP_ADMIN_EMAILS"].split(",")
-    if x.strip()
-)
+# ---------------- Secrets (MODO B) ----------------
+def _sec(key: str, default=None):
+    return st.secrets.get(key, default)
 
-OAUTH_CLIENT_ID = st.secrets["OAUTH_CLIENT_ID"]
-OAUTH_CLIENT_SECRET = st.secrets["OAUTH_CLIENT_SECRET"]
-OAUTH_REDIRECT_URI = st.secrets["OAUTH_REDIRECT_URI"].rstrip("/")  # canonical
-DRIVE_REPORTS_FOLDER_ID = st.secrets.get("DRIVE_REPORTS_FOLDER_ID", "").strip()  # optional; empty = raíz Mi unidad
+GCP_TYPE = _sec("GCP_TYPE")
+GCP_PROJECT_ID = _sec("GCP_PROJECT_ID")
+GCP_PRIVATE_KEY_ID = _sec("GCP_PRIVATE_KEY_ID")
+GCP_PRIVATE_KEY = _sec("GCP_PRIVATE_KEY")
+GCP_CLIENT_EMAIL = _sec("GCP_CLIENT_EMAIL")
+GCP_CLIENT_ID = _sec("GCP_CLIENT_ID")
+GCP_AUTH_URI = _sec("GCP_AUTH_URI")
+GCP_TOKEN_URI = _sec("GCP_TOKEN_URI")
+GCP_AUTH_PROVIDER_X509_CERT_URL = _sec("GCP_AUTH_PROVIDER_X509_CERT_URL")
+GCP_CLIENT_X509_CERT_URL = _sec("GCP_CLIENT_X509_CERT_URL")
 
-INVITE_EXPIRY_HOURS = int(st.secrets.get("INVITE_EXPIRY_HOURS", "48"))
+SHEET_ID = _sec("SHEET_ID")
+BOOTSTRAP_ADMIN_EMAILS = _sec("BOOTSTRAP_ADMIN_EMAILS", "")
+APP_PEPPER = _sec("APP_PEPPER", "pepper")
+INVITE_EXPIRY_HOURS = int(_sec("INVITE_EXPIRY_HOURS", "48"))
+BOOTSTRAP_SETUP_TOKEN = _sec("BOOTSTRAP_SETUP_TOKEN", "")
+FOTOS_ROOT_FOLDER_ID = _sec("FOTOS_ROOT_FOLDER_ID", "")  # opcional (no se usa si incrustas foto en informe)
+OAUTH_CLIENT_ID = _sec("OAUTH_CLIENT_ID", "")
+OAUTH_CLIENT_SECRET = _sec("OAUTH_CLIENT_SECRET", "")
+OAUTH_REDIRECT_URI = _sec("OAUTH_REDIRECT_URI", "")
+DRIVE_REPORTS_FOLDER_ID = _sec("DRIVE_REPORTS_FOLDER_ID", "")
 
-# scopes
-SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
-DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file"
+BOOTSTRAP_ADMINS = [e.strip().lower() for e in BOOTSTRAP_ADMIN_EMAILS.split(",") if e.strip()]
 
-GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
-GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+# Drive OAuth scopes: mínimo para subir/crear archivos
+DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
-
-# -------------------------
-# Schema (tabs/headers)
-# -------------------------
-TABS_HEADERS: Dict[str, List[str]] = {
-    "AppConfig": ["key", "value"],
-    "Users": ["email", "display_name", "is_admin", "active", "created_at"],
-    "Invites": ["invite_code", "email", "created_by", "created_at", "expires_at", "used_at", "used_by"],
-    "Communities": ["community_id", "name", "active", "created_at"],
-    "Installations": ["installation_id", "community_id", "category", "name", "active", "created_at"],
-    "Tasks": ["task_id", "community_id", "installation_id", "task", "active", "created_at"],
-    "UserCommunityAccess": ["email", "community_id", "role", "can_create_reports", "can_view_summary", "active", "created_at"],
-    "Reports": [
-        "report_id", "community_id", "community_name",
-        "status", "created_by_email", "created_at", "updated_at",
-        "drive_pdf_file_id", "drive_pdf_filename",
-    ],
-    "ReportItems": [
-        "report_id", "community_id",
-        "installation_id", "installation_name", "category",
-        "task_id", "task",
-        "status", "note",
-        "photo_drive_file_id", "photo_sha1",
-        "updated_at",
-    ],
+# Roles
+ROLE_ADMIN = "Admin"
+ROLE_EDITOR = "Editor"   # crea informes + ve resumen
+ROLE_VIEWER = "Viewer"   # solo ve resumen
+NON_ADMIN_ROLES = ["Supervisor", "Mantenedor", "Analista Interno", "Conserje"]  # etiqueta/UX
+ROLE_MAP = {
+    "Supervisor": ROLE_EDITOR,
+    "Mantenedor": ROLE_EDITOR,
+    "Analista Interno": ROLE_EDITOR,
+    "Conserje": ROLE_EDITOR,  # puedes cambiar a Viewer si quieres
 }
 
-CATEGORY_ORDER = ["Críticos", "Infraestructura", "Espacio Común", "Accesos", "Higiene", "Comunes", "Infra"]
+# Sheet tabs
+TAB_USERS = "Users"
+TAB_INVITES = "Invites"
+TAB_COMMUNITIES = "Communities"
+TAB_INSTALLATIONS = "Installations"
+TAB_TASKS = "Tasks"
+TAB_REPORTS = "Reports"
+TAB_REPORTITEMS = "ReportItems"
+
+USERS_HEADERS = [
+    "user_id", "email", "role", "role_label", "status",
+    "communities_csv",
+    "pw_salt", "pw_hash",
+    "created_at", "last_login",
+]
+INVITES_HEADERS = [
+    "invite_id", "email", "role", "role_label", "communities_csv",
+    "code_salt", "code_hash",
+    "expires_at", "created_at", "created_by", "used_at",
+]
+COMMUNITIES_HEADERS = [
+    "community_id", "name", "is_active", "photo_drive_file_id",
+    "created_at", "updated_at",
+]
+INSTALLATIONS_HEADERS = [
+    "installation_id", "community_id", "category", "installation",
+    "created_at", "updated_at",
+]
+TASKS_HEADERS = [
+    "task_id", "installation_id", "task",
+    "created_at", "updated_at",
+]
+REPORTS_HEADERS = [
+    "report_id", "community_id", "report_date", "status",
+    "created_by", "created_at", "updated_at",
+    "drive_pdf_file_id", "drive_pdf_link",
+    "drive_docx_file_id", "drive_docx_link",
+]
+REPORTITEMS_HEADERS = [
+    "report_item_id", "report_id", "category", "installation", "task",
+    "status", "note",
+    "photo_mime", "photo_b64",
+    "updated_at",
+]
+
+CATEGORIES_DEFAULT = ["Críticos", "Infraestructura", "Espacios Comunes", "Accesos", "Higiene", "Otros"]
 
 
-# -------------------------
-# Utils
-# -------------------------
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
+# ============================================================
+# UTIL: HASHING
+# ============================================================
 
-def iso(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+def _rand_salt() -> str:
+    return base64.urlsafe_b64encode(os.urandom(16)).decode("utf-8").rstrip("=")
 
-def parse_iso(s: str) -> datetime:
-    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+def _hash_with_pepper(value: str, salt: str) -> str:
+    # PBKDF2-ish simple: (salt + value + pepper) hashed multiple times
+    data = (salt + value + APP_PEPPER).encode("utf-8")
+    h = hashlib.sha256(data).digest()
+    for _ in range(60_000):
+        h = hashlib.sha256(h).digest()
+    return base64.urlsafe_b64encode(h).decode("utf-8").rstrip("=")
 
-def norm_email(s: str) -> str:
-    return (s or "").strip().lower()
+def _norm_email(email: str) -> str:
+    return (email or "").strip().lower()
 
-def is_bootstrap_admin(email: str) -> bool:
-    return norm_email(email) in BOOTSTRAP_ADMIN_EMAILS
+def _now_iso() -> str:
+    return NOW().strftime("%Y-%m-%d %H:%M:%S")
 
-
-# -------------------------
-# Backoff for HTTP
-# -------------------------
-def _sleep_backoff(attempt: int) -> None:
-    base = 0.7 * (2 ** (attempt - 1))
-    jitter = secrets.randbelow(250) / 1000.0
-    time.sleep(min(base + jitter, 10.0))
-
-def request_with_backoff(
-    method: str,
-    url: str,
-    *,
-    headers: Optional[dict] = None,
-    params: Optional[dict] = None,
-    json_body: Any = None,
-    data: Any = None,
-    timeout: int = 60,
-    max_attempts: int = 8,
-) -> requests.Response:
-    for attempt in range(1, max_attempts + 1):
-        resp = requests.request(
-            method,
-            url,
-            headers=headers,
-            params=params,
-            json=json_body,
-            data=data,
-            timeout=timeout,
-        )
-        if resp.status_code in (429, 500, 502, 503, 504):
-            _sleep_backoff(attempt)
-            continue
-        return resp
-    return resp
+def _today_iso() -> str:
+    return date.today().isoformat()
 
 
-# -------------------------
-# Sheets (Service Account) via REST
-# -------------------------
+# ============================================================
+# GOOGLE SHEETS (Service Account)
+# ============================================================
+
+def _service_account_info() -> dict:
+    # Construye dict compatible con google.oauth2.service_account
+    return {
+        "type": GCP_TYPE,
+        "project_id": GCP_PROJECT_ID,
+        "private_key_id": GCP_PRIVATE_KEY_ID,
+        "private_key": (GCP_PRIVATE_KEY or "").replace("\\n", "\n"),
+        "client_email": GCP_CLIENT_EMAIL,
+        "client_id": GCP_CLIENT_ID,
+        "auth_uri": GCP_AUTH_URI,
+        "token_uri": GCP_TOKEN_URI,
+        "auth_provider_x509_cert_url": GCP_AUTH_PROVIDER_X509_CERT_URL,
+        "client_x509_cert_url": GCP_CLIENT_X509_CERT_URL,
+    }
+
 @st.cache_resource(show_spinner=False)
-def _sa_creds() -> SACredentials:
-    # Expect GCP_SERVICE_ACCOUNT as JSON string in secrets
-    sa_raw = st.secrets["GCP_SERVICE_ACCOUNT"]
-    if isinstance(sa_raw, str):
-        info = json.loads(sa_raw)
-    else:
-        info = dict(sa_raw)
-    return SACredentials.from_service_account_info(info, scopes=[SHEETS_SCOPE])
-
-@st.cache_data(ttl=45 * 60, show_spinner=False)
-def _sa_access_token() -> str:
-    creds = _sa_creds()
-    # google-auth refresh mechanism
-    from google.auth.transport.requests import Request as GARequest
-    creds.refresh(GARequest())
-    return creds.token
-
-def sheets_api_headers() -> dict:
-    return {"Authorization": f"Bearer {_sa_access_token()}"}
-
-def sheets_url(path: str) -> str:
-    return f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}{path}"
-
-def sheets_get_meta() -> dict:
-    resp = request_with_backoff("GET", sheets_url(""), headers=sheets_api_headers(), params={"fields": "sheets(properties(title))"})
-    if resp.status_code >= 400:
-        raise RuntimeError(f"Google Sheets meta error {resp.status_code}: {resp.text}")
-    return resp.json()
-
-def sheets_batch_update(body: dict) -> dict:
-    resp = request_with_backoff("POST", sheets_url(":batchUpdate"), headers={**sheets_api_headers(), "Content-Type": "application/json"}, json_body=body)
-    if resp.status_code >= 400:
-        raise RuntimeError(f"Google Sheets batchUpdate error {resp.status_code}: {resp.text}")
-    return resp.json()
-
-def sheets_values_get(a1: str) -> List[List[str]]:
-    enc = requests.utils.quote(a1, safe="!:'(),-._~")
-    resp = request_with_backoff("GET", sheets_url(f"/values/{enc}"), headers=sheets_api_headers())
-    if resp.status_code >= 400:
-        raise RuntimeError(f"Google Sheets values.get error {resp.status_code}: {resp.text}")
-    return resp.json().get("values", [])
-
-def sheets_values_update(a1: str, values: List[List[Any]]) -> None:
-    enc = requests.utils.quote(a1, safe="!:'(),-._~")
-    body = {"range": a1, "majorDimension": "ROWS", "values": values}
-    resp = request_with_backoff(
-        "PUT",
-        sheets_url(f"/values/{enc}"),
-        headers={**sheets_api_headers(), "Content-Type": "application/json"},
-        params={"valueInputOption": "RAW"},
-        json_body=body,
+def sheets_service():
+    info = _service_account_info()
+    creds = service_account.Credentials.from_service_account_info(
+        info,
+        scopes=["https://www.googleapis.com/auth/spreadsheets"],
     )
-    if resp.status_code >= 400:
-        raise RuntimeError(f"Google Sheets values.update error {resp.status_code}: {resp.text}")
+    return build("sheets", "v4", credentials=creds)
 
-def sheets_values_append(tab: str, values: List[List[Any]]) -> None:
-    a1 = f"{tab}!A1"
-    enc = requests.utils.quote(a1, safe="!:'(),-._~")
-    body = {"range": a1, "majorDimension": "ROWS", "values": values}
-    resp = request_with_backoff(
-        "POST",
-        sheets_url(f"/values/{enc}:append"),
-        headers={**sheets_api_headers(), "Content-Type": "application/json"},
-        params={"valueInputOption": "RAW", "insertDataOption": "INSERT_ROWS"},
-        json_body=body,
+def _sheets_call(fn, *args, **kwargs):
+    # Retry simple para 429/503
+    backoff = 0.8
+    for attempt in range(6):
+        try:
+            return fn(*args, **kwargs)
+        except HttpError as e:
+            status = getattr(e, "status_code", None) or getattr(getattr(e, "resp", None), "status", None)
+            if status in (429, 500, 503):
+                time.sleep(backoff)
+                backoff *= 1.8
+                continue
+            raise
+
+def sheets_get_spreadsheet(spreadsheet_id: str):
+    svc = sheets_service()
+    return _sheets_call(svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute)
+
+def sheets_values_get(range_a1: str):
+    svc = sheets_service()
+    return _sheets_call(
+        svc.spreadsheets().values().get(spreadsheetId=SHEET_ID, range=range_a1).execute
     )
-    if resp.status_code >= 400:
-        raise RuntimeError(f"Google Sheets values.append error {resp.status_code}: {resp.text}")
 
-def ensure_tabs_and_headers(force_reset: bool = False) -> None:
-    meta = sheets_get_meta()
-    existing = set(s["properties"]["title"] for s in meta.get("sheets", []))
-
-    requests_list = []
-
-    # create missing tabs
-    for tab, headers in TABS_HEADERS.items():
-        if tab not in existing:
-            requests_list.append({"addSheet": {"properties": {"title": tab}}})
-
-    if requests_list:
-        sheets_batch_update({"requests": requests_list})
-        st.cache_data.clear()
-
-    # ensure headers (and optional reset)
-    for tab, headers in TABS_HEADERS.items():
-        if force_reset:
-            # Clear entire sheet then write header
-            sheets_values_update(f"{tab}!A1:Z", [])
-            sheets_values_update(f"{tab}!A1:{chr(64+len(headers))}1", [headers])
-        else:
-            row1 = sheets_values_get(f"{tab}!A1:Z1")
-            if not row1 or row1[0] != headers:
-                # overwrite header only (keeps data, but mismatch can break logic; for testing, overwrite)
-                sheets_values_update(f"{tab}!A1:{chr(64+len(headers))}1", [headers])
-
-
-def read_table(tab: str) -> Tuple[List[str], List[Dict[str, str]]]:
-    values = sheets_values_get(f"{tab}!A1:Z")
-    if not values:
-        return TABS_HEADERS[tab], []
-    headers = values[0]
-    rows = []
-    for r in values[1:]:
-        row = {headers[i]: (r[i] if i < len(r) else "") for i in range(len(headers))}
-        rows.append(row)
-    return headers, rows
-
-def write_table(tab: str, headers: List[str], rows: List[Dict[str, Any]]) -> None:
-    out = [headers]
-    for row in rows:
-        out.append([row.get(h, "") for h in headers])
-    sheets_values_update(f"{tab}!A1:{chr(64+len(headers))}{len(out)}", out)
-
-
-# -------------------------
-# Crypto for storing OAuth token in Sheets (AppConfig)
-# -------------------------
-def _derive_fernet_key(pepper: str, salt: bytes) -> bytes:
-    kdf = Scrypt(
-        salt=salt,
-        length=32,
-        n=2**14,
-        r=8,
-        p=1,
-        backend=default_backend(),
+def sheets_values_update(range_a1: str, values: List[List[str]]):
+    svc = sheets_service()
+    body = {"values": values}
+    return _sheets_call(
+        svc.spreadsheets().values().update(
+            spreadsheetId=SHEET_ID,
+            range=range_a1,
+            valueInputOption="RAW",
+            body=body,
+        ).execute
     )
-    key = kdf.derive(pepper.encode("utf-8"))
-    return base64.urlsafe_b64encode(key)
 
-def encrypt_text(plain: str) -> str:
-    salt = secrets.token_bytes(16)
-    fkey = _derive_fernet_key(APP_PEPPER, salt)
-    f = Fernet(fkey)
-    ct = f.encrypt(plain.encode("utf-8"))
-    payload = {"salt": base64.b64encode(salt).decode("utf-8"), "ct": ct.decode("utf-8")}
-    return json.dumps(payload)
+def sheets_values_append(range_a1: str, values: List[List[str]]):
+    svc = sheets_service()
+    body = {"values": values}
+    return _sheets_call(
+        svc.spreadsheets().values().append(
+            spreadsheetId=SHEET_ID,
+            range=range_a1,
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body=body,
+        ).execute
+    )
 
-def decrypt_text(cipher_json: str) -> str:
-    payload = json.loads(cipher_json)
-    salt = base64.b64decode(payload["salt"])
-    ct = payload["ct"].encode("utf-8")
-    fkey = _derive_fernet_key(APP_PEPPER, salt)
-    f = Fernet(fkey)
-    pt = f.decrypt(ct)
-    return pt.decode("utf-8")
+def sheets_batch_update(requests: list):
+    svc = sheets_service()
+    body = {"requests": requests}
+    return _sheets_call(
+        svc.spreadsheets().batchUpdate(spreadsheetId=SHEET_ID, body=body).execute
+    )
 
+def _ensure_sheet_tab(tab_name: str):
+    meta = sheets_get_spreadsheet(SHEET_ID)
+    tabs = {s["properties"]["title"] for s in meta.get("sheets", [])}
+    if tab_name in tabs:
+        return
+    sheets_batch_update([{
+        "addSheet": {"properties": {"title": tab_name}}
+    }])
 
-# -------------------------
-# AppConfig helpers
-# -------------------------
-def appconfig_get(key: str) -> Optional[str]:
-    _, rows = read_table("AppConfig")
+def _ensure_headers(tab: str, headers: List[str]):
+    _ensure_sheet_tab(tab)
+    a1 = f"{tab}!A1:Z1"
+    got = sheets_values_get(a1).get("values", [])
+    if got and got[0] == headers:
+        return
+    sheets_values_update(f"{tab}!A1", [headers])
+
+def ensure_schema():
+    if st.session_state.get("_schema_ok"):
+        return
+    for t, h in [
+        (TAB_USERS, USERS_HEADERS),
+        (TAB_INVITES, INVITES_HEADERS),
+        (TAB_COMMUNITIES, COMMUNITIES_HEADERS),
+        (TAB_INSTALLATIONS, INSTALLATIONS_HEADERS),
+        (TAB_TASKS, TASKS_HEADERS),
+        (TAB_REPORTS, REPORTS_HEADERS),
+        (TAB_REPORTITEMS, REPORTITEMS_HEADERS),
+    ]:
+        _ensure_headers(t, h)
+    st.session_state["_schema_ok"] = True
+
+def _sheet_to_df(tab: str, headers: List[str]) -> pd.DataFrame:
+    ensure_schema()
+    data = sheets_values_get(f"{tab}!A1:Z").get("values", [])
+    if not data:
+        return pd.DataFrame(columns=headers)
+    got_headers = data[0]
+    rows = data[1:]
+    # Normaliza a largo de headers esperado
+    col_count = len(headers)
+    normalized = []
     for r in rows:
-        if r.get("key") == key:
-            return r.get("value") or ""
-    return None
+        r = (r + [""] * col_count)[:col_count]
+        normalized.append(r)
+    df = pd.DataFrame(normalized, columns=headers)
+    return df
 
-def appconfig_set(key: str, value: str) -> None:
-    headers, rows = read_table("AppConfig")
-    found = False
-    for r in rows:
-        if r.get("key") == key:
-            r["value"] = value
-            found = True
-            break
-    if not found:
-        rows.append({"key": key, "value": value})
-    write_table("AppConfig", headers, rows)
+def _df_to_sheet_overwrite(tab: str, headers: List[str], df: pd.DataFrame):
+    ensure_schema()
+    df2 = df.copy()
+    # asegura columnas
+    for c in headers:
+        if c not in df2.columns:
+            df2[c] = ""
+    df2 = df2[headers]
+    values = [headers] + df2.astype(str).fillna("").values.tolist()
+    sheets_values_update(f"{tab}!A1", values)
+
+def _append_row(tab: str, headers: List[str], row: dict):
+    ensure_schema()
+    values = [[str(row.get(h, "")) for h in headers]]
+    sheets_values_append(f"{tab}!A1", values)
+
+def _update_row_by_id(tab: str, headers: List[str], id_col: str, row_id: str, updates: dict):
+    df = _sheet_to_df(tab, headers)
+    if df.empty:
+        return False
+    mask = df[id_col].astype(str) == str(row_id)
+    if not mask.any():
+        return False
+    for k, v in updates.items():
+        if k in df.columns:
+            df.loc[mask, k] = str(v)
+    _df_to_sheet_overwrite(tab, headers, df)
+    return True
 
 
-# -------------------------
-# OAuth Drive (Mi unidad) – token stored encrypted in Sheets
-# -------------------------
-def build_oauth_auth_url(state: str) -> str:
-    params = {
-        "client_id": OAUTH_CLIENT_ID,
-        "redirect_uri": OAUTH_REDIRECT_URI,
-        "response_type": "code",
-        "scope": DRIVE_SCOPE,
-        "access_type": "offline",
-        "prompt": "consent",
-        "state": state,
+# ============================================================
+# GOOGLE DRIVE (OAuth) — subir PDFs/DOCX a "Mi unidad"
+# ============================================================
+
+def _oauth_client_config():
+    return {
+        "web": {
+            "client_id": OAUTH_CLIENT_ID,
+            "client_secret": OAUTH_CLIENT_SECRET,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": [OAUTH_REDIRECT_URI],
+        }
     }
-    return requests.Request("GET", GOOGLE_AUTH_URL, params=params).prepare().url
 
-def exchange_code_for_token(code: str) -> dict:
-    data = {
-        "client_id": OAUTH_CLIENT_ID,
-        "client_secret": OAUTH_CLIENT_SECRET,
-        "redirect_uri": OAUTH_REDIRECT_URI,
-        "grant_type": "authorization_code",
-        "code": code,
-    }
-    resp = request_with_backoff("POST", GOOGLE_TOKEN_URL, data=data, timeout=30)
-    if resp.status_code >= 400:
-        raise RuntimeError(f"OAuth token exchange error {resp.status_code}: {resp.text}")
-    return resp.json()
-
-def refresh_access_token(refresh_token: str) -> dict:
-    data = {
-        "client_id": OAUTH_CLIENT_ID,
-        "client_secret": OAUTH_CLIENT_SECRET,
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token,
-    }
-    resp = request_with_backoff("POST", GOOGLE_TOKEN_URL, data=data, timeout=30)
-    if resp.status_code >= 400:
-        raise RuntimeError(f"OAuth refresh error {resp.status_code}: {resp.text}")
-    return resp.json()
-
-def get_drive_token() -> Optional[dict]:
-    enc = appconfig_get("DRIVE_OAUTH_TOKEN")
-    if not enc:
+def _get_drive_creds_from_state() -> Optional[Credentials]:
+    raw = st.session_state.get("drive_oauth_token")
+    if not raw:
         return None
-    raw = decrypt_text(enc)
-    return json.loads(raw)
+    creds = Credentials.from_authorized_user_info(raw, scopes=DRIVE_SCOPES)
+    if creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+            st.session_state["drive_oauth_token"] = json.loads(creds.to_json())
+        except Exception:
+            return None
+    return creds
 
-def save_drive_token(token: dict) -> None:
-    enc = encrypt_text(json.dumps(token))
-    appconfig_set("DRIVE_OAUTH_TOKEN", enc)
+@st.cache_resource(show_spinner=False)
+def _drive_service_cached(token_json_str: str):
+    raw = json.loads(token_json_str)
+    creds = Credentials.from_authorized_user_info(raw, scopes=DRIVE_SCOPES)
+    return build("drive", "v3", credentials=creds)
 
-def ensure_valid_access_token(token: dict) -> dict:
-    # token fields: access_token, refresh_token, expires_in, created_at
-    now = int(time.time())
-    created_at = int(token.get("created_at", now))
-    expires_in = int(token.get("expires_in", 0))
-    if token.get("access_token") and (now < created_at + expires_in - 60):
-        return token
+def drive_service() -> Optional[object]:
+    creds = _get_drive_creds_from_state()
+    if not creds:
+        return None
+    return _drive_service_cached(creds.to_json())
 
-    rt = token.get("refresh_token")
-    if not rt:
-        return {}
-    refreshed = refresh_access_token(rt)
-    token["access_token"] = refreshed["access_token"]
-    token["expires_in"] = refreshed.get("expires_in", 3600)
-    token["created_at"] = int(time.time())
-    save_drive_token(token)
-    return token
+def drive_upload_bytes(
+    file_bytes: bytes,
+    filename: str,
+    mime_type: str,
+    parent_folder_id: str,
+) -> Tuple[str, str]:
+    svc = drive_service()
+    if svc is None:
+        raise RuntimeError("Drive no está conectado (OAuth). Conéctalo con un admin.")
+    from googleapiclient.http import MediaIoBaseUpload
 
-def drive_headers(access_token: str) -> dict:
-    return {"Authorization": f"Bearer {access_token}"}
-
-def drive_files_create(access_token: str, metadata: dict, media: Optional[bytes] = None, mime: Optional[str] = None) -> dict:
-    if media is None:
-        resp = request_with_backoff(
-            "POST",
-            "https://www.googleapis.com/drive/v3/files",
-            headers={**drive_headers(access_token), "Content-Type": "application/json"},
-            params={"fields": "id,name,webViewLink"},
-            json_body=metadata,
-            timeout=60,
-        )
-        if resp.status_code >= 400:
-            raise RuntimeError(f"Drive create error {resp.status_code}: {resp.text}")
-        return resp.json()
-
-    boundary = "===============" + secrets.token_hex(12)
-    delimiter = f"\r\n--{boundary}\r\n"
-    close_delim = f"\r\n--{boundary}--\r\n"
-
-    body = (
-        delimiter
-        + "Content-Type: application/json; charset=UTF-8\r\n\r\n"
-        + json.dumps(metadata)
-        + delimiter
-        + f"Content-Type: {mime or 'application/octet-stream'}\r\n\r\n"
-    ).encode("utf-8") + media + close_delim.encode("utf-8")
-
-    headers = {
-        **drive_headers(access_token),
-        "Content-Type": f"multipart/related; boundary={boundary}",
-    }
-    resp = request_with_backoff(
-        "POST",
-        "https://www.googleapis.com/upload/drive/v3/files",
-        headers=headers,
-        params={"uploadType": "multipart", "fields": "id,name,webViewLink"},
-        data=body,
-        timeout=60,
+    media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=mime_type, resumable=False)
+    body = {"name": filename}
+    if parent_folder_id:
+        body["parents"] = [parent_folder_id]
+    created = _sheets_call(
+        svc.files().create(
+            body=body,
+            media_body=media,
+            fields="id, webViewLink",
+        ).execute
     )
-    if resp.status_code >= 400:
-        raise RuntimeError(f"Drive upload error {resp.status_code}: {resp.text}")
-    return resp.json()
-
-def drive_files_get_media(access_token: str, file_id: str) -> bytes:
-    resp = request_with_backoff(
-        "GET",
-        f"https://www.googleapis.com/drive/v3/files/{file_id}",
-        headers=drive_headers(access_token),
-        params={"alt": "media"},
-        timeout=60,
-    )
-    if resp.status_code >= 400:
-        raise RuntimeError(f"Drive download error {resp.status_code}: {resp.text}")
-    return resp.content
-
-def drive_find_folder(access_token: str, parent_id: str, name: str) -> Optional[str]:
-    safe_name = (name or "").replace("'", "\\'")
-    q = (
-        "mimeType='application/vnd.google-apps.folder' and "
-        f"name='{safe_name}' and trashed=false and "
-        f"'{parent_id}' in parents"
-    )
-    resp = request_with_backoff(
-        "GET",
-        "https://www.googleapis.com/drive/v3/files",
-        headers=drive_headers(access_token),
-        params={"q": q, "fields": "files(id,name)"},
-        timeout=60,
-    )
-    if resp.status_code >= 400:
-        raise RuntimeError(f"Drive list error {resp.status_code}: {resp.text}")
-    files = resp.json().get("files", [])
-    return files[0]["id"] if files else None
-
-def drive_ensure_folder(access_token: str, parent_id: str, name: str) -> str:
-    fid = drive_find_folder(access_token, parent_id, name)
-    if fid:
-        return fid
-    meta = {
-        "name": name,
-        "mimeType": "application/vnd.google-apps.folder",
-        "parents": [parent_id] if parent_id else [],
-    }
-    created = drive_files_create(access_token, meta)
-    return created["id"]
+    return created["id"], created.get("webViewLink", "")
 
 
-# -------------------------
-# Auth (simple): email + invite code
-# -------------------------
-def user_get(email: str) -> Optional[dict]:
-    _, users = read_table("Users")
-    em = norm_email(email)
-    for u in users:
-        if norm_email(u.get("email", "")) == em and u.get("active", "true").lower() == "true":
-            return u
-    return None
+# ============================================================
+# BOOTSTRAP + AUTH
+# ============================================================
 
-def user_is_admin(email: str) -> bool:
-    u = user_get(email)
-    if u and u.get("is_admin", "").lower() == "true":
+def get_users_df() -> pd.DataFrame:
+    return _sheet_to_df(TAB_USERS, USERS_HEADERS)
+
+def get_invites_df() -> pd.DataFrame:
+    return _sheet_to_df(TAB_INVITES, INVITES_HEADERS)
+
+def get_communities_df() -> pd.DataFrame:
+    df = _sheet_to_df(TAB_COMMUNITIES, COMMUNITIES_HEADERS)
+    if not df.empty:
+        df["is_active"] = df["is_active"].astype(str).str.lower().isin(["true", "1", "yes", "y"])
+    return df
+
+def get_installations_df() -> pd.DataFrame:
+    return _sheet_to_df(TAB_INSTALLATIONS, INSTALLATIONS_HEADERS)
+
+def get_tasks_df() -> pd.DataFrame:
+    return _sheet_to_df(TAB_TASKS, TASKS_HEADERS)
+
+def get_reports_df() -> pd.DataFrame:
+    return _sheet_to_df(TAB_REPORTS, REPORTS_HEADERS)
+
+def get_reportitems_df() -> pd.DataFrame:
+    return _sheet_to_df(TAB_REPORTITEMS, REPORTITEMS_HEADERS)
+
+def _bootstrap_needed() -> bool:
+    df = get_users_df()
+    return df.empty
+
+def _bootstrap_create_admins(setup_token: str):
+    if not BOOTSTRAP_SETUP_TOKEN:
+        raise RuntimeError("Falta BOOTSTRAP_SETUP_TOKEN en secrets.")
+    if setup_token.strip() != BOOTSTRAP_SETUP_TOKEN.strip():
+        raise RuntimeError("BOOTSTRAP_SETUP_TOKEN inválido.")
+
+    now = _now_iso()
+    for email in BOOTSTRAP_ADMINS:
+        user_id = str(uuid.uuid4())
+        pw_salt = _rand_salt()
+        # password inicial: se fuerza a setear luego (guardamos hash vacío)
+        row = {
+            "user_id": user_id,
+            "email": email,
+            "role": ROLE_ADMIN,
+            "role_label": ROLE_ADMIN,
+            "status": "active",
+            "communities_csv": "*",
+            "pw_salt": pw_salt,
+            "pw_hash": "",  # sin pass, se setea al entrar
+            "created_at": now,
+            "last_login": "",
+        }
+        _append_row(TAB_USERS, USERS_HEADERS, row)
+
+def _user_has_password(user_row: pd.Series) -> bool:
+    return bool(str(user_row.get("pw_hash", "")).strip())
+
+def _set_user_password(email: str, new_password: str):
+    df = get_users_df()
+    em = _norm_email(email)
+    mask = df["email"].astype(str).str.lower() == em
+    if not mask.any():
+        raise RuntimeError("Usuario no existe.")
+    salt = df.loc[mask, "pw_salt"].astype(str).iloc[0] or _rand_salt()
+    pw_hash = _hash_with_pepper(new_password, salt)
+    df.loc[mask, "pw_salt"] = salt
+    df.loc[mask, "pw_hash"] = pw_hash
+    df.loc[mask, "updated_at"] = _now_iso() if "updated_at" in df.columns else df.loc[mask, "created_at"]
+    _df_to_sheet_overwrite(TAB_USERS, USERS_HEADERS, df)
+
+def _verify_password(email: str, password: str) -> Optional[pd.Series]:
+    df = get_users_df()
+    em = _norm_email(email)
+    row = df[df["email"].astype(str).str.lower() == em]
+    if row.empty:
+        return None
+    r = row.iloc[0]
+    if str(r.get("status", "")).strip().lower() != "active":
+        return None
+    if not _user_has_password(r):
+        # permitido, pero se pedirá setear contraseña
+        return r
+    salt = str(r.get("pw_salt", ""))
+    expected = str(r.get("pw_hash", ""))
+    got = _hash_with_pepper(password, salt)
+    return r if got == expected else None
+
+def _can_access_community(user_row: dict, community_id: str) -> bool:
+    csv = (user_row.get("communities_csv") or "").strip()
+    if csv == "*" and user_row.get("role") == ROLE_ADMIN:
         return True
-    return is_bootstrap_admin(email)
+    allowed = [x.strip() for x in csv.split(",") if x.strip()]
+    return community_id in allowed or "*" in allowed
 
-def ensure_bootstrap_users() -> None:
-    headers, users = read_table("Users")
-    existing = {norm_email(u.get("email", "")) for u in users}
-    for em in BOOTSTRAP_ADMIN_EMAILS:
-        if em not in existing:
-            users.append({
-                "email": em,
-                "display_name": em.split("@")[0],
-                "is_admin": "true",
-                "active": "true",
-                "created_at": iso(now_utc()),
-            })
-    write_table("Users", headers, users)
+def _role_base(role: str) -> str:
+    if role == ROLE_ADMIN:
+        return ROLE_ADMIN
+    if role in (ROLE_EDITOR, ROLE_VIEWER):
+        return role
+    return ROLE_MAP.get(role, ROLE_EDITOR)
 
-def invite_create(target_email: str, created_by: str) -> str:
-    code = secrets.token_urlsafe(10).replace("-", "").replace("_", "")[:12]
-    created_at = now_utc()
-    expires_at = created_at + timedelta(hours=INVITE_EXPIRY_HOURS)
-    _, inv = read_table("Invites")
-    inv.append({
-        "invite_code": code,
-        "email": norm_email(target_email),
-        "created_by": norm_email(created_by),
-        "created_at": iso(created_at),
-        "expires_at": iso(expires_at),
+def _login_user(user_row: dict):
+    st.session_state["auth_user"] = {
+        "user_id": user_row.get("user_id"),
+        "email": _norm_email(user_row.get("email")),
+        "role": user_row.get("role"),
+        "role_label": user_row.get("role_label") or user_row.get("role"),
+        "communities_csv": user_row.get("communities_csv", ""),
+    }
+    _update_row_by_id(
+        TAB_USERS, USERS_HEADERS, "user_id", user_row["user_id"],
+        {"last_login": _now_iso()}
+    )
+
+def _logout():
+    st.session_state.pop("auth_user", None)
+    st.session_state.pop("drive_oauth_token", None)
+    st.query_params.clear()
+    st.rerun()
+
+def current_user() -> Optional[dict]:
+    return st.session_state.get("auth_user")
+
+
+# ============================================================
+# INVITES (Admin)
+# ============================================================
+
+def create_invite(email: str, role: str, role_label: str, communities_csv: str, created_by: str) -> str:
+    email = _norm_email(email)
+    if not email:
+        raise RuntimeError("Email inválido.")
+    invite_id = str(uuid.uuid4())
+    code_plain = uuid.uuid4().hex[:10].upper()  # código humano
+    code_salt = _rand_salt()
+    code_hash = _hash_with_pepper(code_plain, code_salt)
+
+    expires_at = (NOW() + timedelta(hours=INVITE_EXPIRY_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
+    row = {
+        "invite_id": invite_id,
+        "email": email,
+        "role": role,
+        "role_label": role_label,
+        "communities_csv": communities_csv,
+        "code_salt": code_salt,
+        "code_hash": code_hash,
+        "expires_at": expires_at,
+        "created_at": _now_iso(),
+        "created_by": created_by,
         "used_at": "",
-        "used_by": "",
-    })
-    write_table("Invites", TABS_HEADERS["Invites"], inv)
-    return code
+    }
+    _append_row(TAB_INVITES, INVITES_HEADERS, row)
+    return code_plain
 
-def invite_use(email: str, code: str) -> bool:
-    headers, inv = read_table("Invites")
-    em = norm_email(email)
-    code = (code or "").strip()
-    now = now_utc()
-    changed = False
-    ok = False
-    for r in inv:
-        if r.get("invite_code") == code and norm_email(r.get("email", "")) == em:
-            # verify unused + not expired
-            if r.get("used_at"):
-                break
-            exp = r.get("expires_at") or ""
-            if exp:
-                if now > parse_iso(exp):
-                    break
-            r["used_at"] = iso(now)
-            r["used_by"] = em
-            changed = True
-            ok = True
-            break
-    if changed:
-        write_table("Invites", headers, inv)
-    return ok
+def redeem_invite(email: str, code_plain: str) -> Tuple[bool, str]:
+    email = _norm_email(email)
+    code_plain = (code_plain or "").strip().upper()
+    df = get_invites_df()
+    if df.empty:
+        return False, "No hay invitaciones."
 
-def ensure_user_exists(email: str, display_name: str = "") -> None:
-    headers, users = read_table("Users")
-    em = norm_email(email)
-    for u in users:
-        if norm_email(u.get("email", "")) == em:
-            # reactivate if needed
-            if u.get("active", "true").lower() != "true":
-                u["active"] = "true"
-                write_table("Users", headers, users)
-            return
-    users.append({
-        "email": em,
-        "display_name": display_name or em.split("@")[0],
-        "is_admin": "false",
-        "active": "true",
-        "created_at": iso(now_utc()),
-    })
-    write_table("Users", headers, users)
+    # filtra por email y no usadas
+    df2 = df[
+        (df["email"].astype(str).str.lower() == email) &
+        (df["used_at"].astype(str).str.strip() == "")
+    ].copy()
 
+    if df2.empty:
+        return False, "No existe una invitación activa para ese email."
 
-# -------------------------
-# Access / communities
-# -------------------------
-def list_communities(active_only: bool = True) -> List[dict]:
-    _, comms = read_table("Communities")
-    if active_only:
-        return [c for c in comms if c.get("active", "true").lower() == "true"]
-    return comms
+    # valida cada una (podrían existir varias)
+    for _, inv in df2.iterrows():
+        try:
+            exp = datetime.strptime(inv["expires_at"], "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            continue
+        if NOW() > exp:
+            continue
 
-def community_create(name: str) -> str:
-    cid = "C_" + secrets.token_hex(6)
-    headers, comms = read_table("Communities")
-    comms.append({
-        "community_id": cid,
-        "name": name.strip(),
-        "active": "true",
-        "created_at": iso(now_utc()),
-    })
-    write_table("Communities", headers, comms)
-    return cid
+        salt = str(inv.get("code_salt", ""))
+        expected = str(inv.get("code_hash", ""))
+        got = _hash_with_pepper(code_plain, salt)
+        if got != expected:
+            continue
 
-def community_delete(cid: str) -> None:
-    # Hard delete test-mode: deletes related rows (Sheets). Does NOT delete Drive assets.
-    # Communities
-    h, comms = read_table("Communities")
-    comms = [c for c in comms if c.get("community_id") != cid]
-    write_table("Communities", h, comms)
+        # crea usuario si no existe
+        users = get_users_df()
+        exists = not users[users["email"].astype(str).str.lower() == email].empty
+        if not exists:
+            user_id = str(uuid.uuid4())
+            pw_salt = _rand_salt()
+            row = {
+                "user_id": user_id,
+                "email": email,
+                "role": inv["role"],
+                "role_label": inv["role_label"],
+                "status": "active",
+                "communities_csv": inv["communities_csv"],
+                "pw_salt": pw_salt,
+                "pw_hash": "",
+                "created_at": _now_iso(),
+                "last_login": "",
+            }
+            _append_row(TAB_USERS, USERS_HEADERS, row)
 
-    # Installations
-    h, inst = read_table("Installations")
-    inst = [i for i in inst if i.get("community_id") != cid]
-    write_table("Installations", h, inst)
+        # marca invite usada
+        _update_row_by_id(
+            TAB_INVITES, INVITES_HEADERS, "invite_id", inv["invite_id"],
+            {"used_at": _now_iso()}
+        )
+        return True, "Invitación aceptada. Ahora define tu contraseña."
 
-    # Tasks
-    h, tsk = read_table("Tasks")
-    tsk = [t for t in tsk if t.get("community_id") != cid]
-    write_table("Tasks", h, tsk)
-
-    # Reports & ReportItems
-    h, reports = read_table("Reports")
-    report_ids = {r.get("report_id") for r in reports if r.get("community_id") == cid}
-    reports = [r for r in reports if r.get("community_id") != cid]
-    write_table("Reports", h, reports)
-
-    h, items = read_table("ReportItems")
-    items = [x for x in items if x.get("community_id") != cid and x.get("report_id") not in report_ids]
-    write_table("ReportItems", h, items)
-
-    # Access
-    h, acc = read_table("UserCommunityAccess")
-    acc = [a for a in acc if a.get("community_id") != cid]
-    write_table("UserCommunityAccess", h, acc)
-
-def access_list_for_user(email: str) -> List[dict]:
-    _, acc = read_table("UserCommunityAccess")
-    em = norm_email(email)
-    rows = [a for a in acc if norm_email(a.get("email", "")) == em and a.get("active", "true").lower() == "true"]
-    return rows
-
-def user_allowed_communities(email: str) -> List[str]:
-    if user_is_admin(email):
-        return [c["community_id"] for c in list_communities(active_only=True)]
-    return [a["community_id"] for a in access_list_for_user(email)]
-
-def set_user_access(email: str, community_id: str, role: str, can_create_reports: bool, can_view_summary: bool, active: bool = True) -> None:
-    headers, acc = read_table("UserCommunityAccess")
-    em = norm_email(email)
-    found = False
-    for a in acc:
-        if norm_email(a.get("email", "")) == em and a.get("community_id") == community_id:
-            a["role"] = role
-            a["can_create_reports"] = "true" if can_create_reports else "false"
-            a["can_view_summary"] = "true" if can_view_summary else "false"
-            a["active"] = "true" if active else "false"
-            a["created_at"] = a.get("created_at") or iso(now_utc())
-            found = True
-            break
-    if not found:
-        acc.append({
-            "email": em,
-            "community_id": community_id,
-            "role": role,
-            "can_create_reports": "true" if can_create_reports else "false",
-            "can_view_summary": "true" if can_view_summary else "false",
-            "active": "true" if active else "false",
-            "created_at": iso(now_utc()),
-        })
-    write_table("UserCommunityAccess", headers, acc)
+    return False, "Código inválido o expirado."
 
 
-# -------------------------
-# Installations + Tasks (admin configured per community)
-# -------------------------
-def installations_for_community(cid: str) -> List[dict]:
-    _, inst = read_table("Installations")
-    return [i for i in inst if i.get("community_id") == cid and i.get("active", "true").lower() == "true"]
+# ============================================================
+# COMMUNITIES / INSTALLATIONS / TASKS (Admin)
+# ============================================================
 
-def tasks_for_community(cid: str) -> List[dict]:
-    _, tsk = read_table("Tasks")
-    return [t for t in tsk if t.get("community_id") == cid and t.get("active", "true").lower() == "true"]
+def create_community(name: str) -> str:
+    name = (name or "").strip()
+    if not name:
+        raise RuntimeError("Nombre inválido.")
+    comm_id = str(uuid.uuid4())
+    now = _now_iso()
+    row = {
+        "community_id": comm_id,
+        "name": name,
+        "is_active": "TRUE",
+        "photo_drive_file_id": "",
+        "created_at": now,
+        "updated_at": now,
+    }
+    _append_row(TAB_COMMUNITIES, COMMUNITIES_HEADERS, row)
+    return comm_id
 
-def installation_add(cid: str, category: str, name: str) -> str:
-    iid = "I_" + secrets.token_hex(6)
-    headers, inst = read_table("Installations")
-    inst.append({
-        "installation_id": iid,
-        "community_id": cid,
-        "category": category.strip(),
-        "name": name.strip(),
-        "active": "true",
-        "created_at": iso(now_utc()),
-    })
-    write_table("Installations", headers, inst)
-    return iid
+def delete_community_permanent(community_id: str):
+    # Borra: comunidad + instalaciones + tareas + reportes + reportitems
+    community_id = str(community_id)
+    cdf = get_communities_df()
+    cdf = cdf[cdf["community_id"].astype(str) != community_id].copy()
+    _df_to_sheet_overwrite(TAB_COMMUNITIES, COMMUNITIES_HEADERS, cdf)
 
-def installation_deactivate(iid: str) -> None:
-    headers, inst = read_table("Installations")
-    for i in inst:
-        if i.get("installation_id") == iid:
-            i["active"] = "false"
-            break
-    write_table("Installations", headers, inst)
+    idf = get_installations_df()
+    to_del_inst = idf[idf["community_id"].astype(str) == community_id]["installation_id"].astype(str).tolist()
+    idf = idf[idf["community_id"].astype(str) != community_id].copy()
+    _df_to_sheet_overwrite(TAB_INSTALLATIONS, INSTALLATIONS_HEADERS, idf)
 
-def task_add(cid: str, installation_id: str, task: str) -> str:
-    tid = "T_" + secrets.token_hex(6)
-    headers, tsk = read_table("Tasks")
-    tsk.append({
+    tdf = get_tasks_df()
+    if to_del_inst:
+        tdf = tdf[~tdf["installation_id"].astype(str).isin(to_del_inst)].copy()
+        _df_to_sheet_overwrite(TAB_TASKS, TASKS_HEADERS, tdf)
+
+    rdf = get_reports_df()
+    to_del_reports = rdf[rdf["community_id"].astype(str) == community_id]["report_id"].astype(str).tolist()
+    rdf = rdf[rdf["community_id"].astype(str) != community_id].copy()
+    _df_to_sheet_overwrite(TAB_REPORTS, REPORTS_HEADERS, rdf)
+
+    ridf = get_reportitems_df()
+    if to_del_reports:
+        ridf = ridf[~ridf["report_id"].astype(str).isin(to_del_reports)].copy()
+        _df_to_sheet_overwrite(TAB_REPORTITEMS, REPORTITEMS_HEADERS, ridf)
+
+def upsert_installation(community_id: str, category: str, installation: str) -> str:
+    community_id = str(community_id)
+    category = (category or "").strip() or "Otros"
+    installation = (installation or "").strip()
+    if not installation:
+        raise RuntimeError("Instalación inválida.")
+
+    df = get_installations_df()
+    now = _now_iso()
+
+    # dedupe natural: (community_id, category, installation)
+    if not df.empty:
+        mask = (
+            (df["community_id"].astype(str) == community_id) &
+            (df["category"].astype(str) == category) &
+            (df["installation"].astype(str) == installation)
+        )
+        if mask.any():
+            inst_id = df.loc[mask, "installation_id"].astype(str).iloc[0]
+            _update_row_by_id(TAB_INSTALLATIONS, INSTALLATIONS_HEADERS, "installation_id", inst_id, {"updated_at": now})
+            return inst_id
+
+    inst_id = str(uuid.uuid4())
+    row = {
+        "installation_id": inst_id,
+        "community_id": community_id,
+        "category": category,
+        "installation": installation,
+        "created_at": now,
+        "updated_at": now,
+    }
+    _append_row(TAB_INSTALLATIONS, INSTALLATIONS_HEADERS, row)
+    return inst_id
+
+def delete_installation(installation_id: str):
+    installation_id = str(installation_id)
+    idf = get_installations_df()
+    idf = idf[idf["installation_id"].astype(str) != installation_id].copy()
+    _df_to_sheet_overwrite(TAB_INSTALLATIONS, INSTALLATIONS_HEADERS, idf)
+
+    tdf = get_tasks_df()
+    tdf = tdf[tdf["installation_id"].astype(str) != installation_id].copy()
+    _df_to_sheet_overwrite(TAB_TASKS, TASKS_HEADERS, tdf)
+
+def upsert_task(installation_id: str, task: str) -> str:
+    installation_id = str(installation_id)
+    task = (task or "").strip()
+    if not task:
+        raise RuntimeError("Tarea inválida.")
+    df = get_tasks_df()
+    now = _now_iso()
+
+    if not df.empty:
+        mask = (df["installation_id"].astype(str) == installation_id) & (df["task"].astype(str) == task)
+        if mask.any():
+            tid = df.loc[mask, "task_id"].astype(str).iloc[0]
+            _update_row_by_id(TAB_TASKS, TASKS_HEADERS, "task_id", tid, {"updated_at": now})
+            return tid
+
+    tid = str(uuid.uuid4())
+    row = {
         "task_id": tid,
-        "community_id": cid,
         "installation_id": installation_id,
-        "task": task.strip(),
-        "active": "true",
-        "created_at": iso(now_utc()),
-    })
-    write_table("Tasks", headers, tsk)
+        "task": task,
+        "created_at": now,
+        "updated_at": now,
+    }
+    _append_row(TAB_TASKS, TASKS_HEADERS, row)
     return tid
 
-def task_deactivate(tid: str) -> None:
-    headers, tsk = read_table("Tasks")
-    for t in tsk:
-        if t.get("task_id") == tid:
-            t["active"] = "false"
-            break
-    write_table("Tasks", headers, tsk)
+def delete_task(task_id: str):
+    task_id = str(task_id)
+    tdf = get_tasks_df()
+    tdf = tdf[tdf["task_id"].astype(str) != task_id].copy()
+    _df_to_sheet_overwrite(TAB_TASKS, TASKS_HEADERS, tdf)
 
 
-# -------------------------
-# Reports
-# -------------------------
-def reports_for_community(cid: str) -> List[dict]:
-    _, reps = read_table("Reports")
-    reps = [r for r in reps if r.get("community_id") == cid]
-    reps.sort(key=lambda x: x.get("created_at", ""), reverse=True)
-    return reps
+# ============================================================
+# REPORTS (Editor/Admin)
+# ============================================================
 
-def report_get(report_id: str) -> Optional[dict]:
-    _, reps = read_table("Reports")
-    for r in reps:
-        if r.get("report_id") == report_id:
-            return r
-    return None
-
-def report_create(cid: str, cname: str, created_by: str) -> str:
-    rid = "R_" + datetime.utcnow().strftime("%Y%m%d_%H%M%S") + "_" + secrets.token_hex(3)
-    headers, reps = read_table("Reports")
-    reps.append({
+def create_report(community_id: str, report_date: str, created_by: str) -> str:
+    rid = str(uuid.uuid4())
+    now = _now_iso()
+    row = {
         "report_id": rid,
-        "community_id": cid,
-        "community_name": cname,
-        "status": "Draft",
-        "created_by_email": norm_email(created_by),
-        "created_at": iso(now_utc()),
-        "updated_at": iso(now_utc()),
+        "community_id": str(community_id),
+        "report_date": report_date,
+        "status": "draft",
+        "created_by": created_by,
+        "created_at": now,
+        "updated_at": now,
         "drive_pdf_file_id": "",
-        "drive_pdf_filename": "",
-    })
-    write_table("Reports", headers, reps)
-
-    # seed ReportItems from configured installations + tasks
-    inst = installations_for_community(cid)
-    tsk = tasks_for_community(cid)
-    inst_by_id = {i["installation_id"]: i for i in inst}
-    tasks_by_inst: Dict[str, List[dict]] = {}
-    for t in tsk:
-        tasks_by_inst.setdefault(t["installation_id"], []).append(t)
-
-    # Create items rows
-    headers_i, items = read_table("ReportItems")
-    for i in inst:
-        its = tasks_by_inst.get(i["installation_id"], [])
-        if not its:
-            # allow 1 default task row if none configured
-            items.append({
-                "report_id": rid,
-                "community_id": cid,
-                "installation_id": i["installation_id"],
-                "installation_name": i["name"],
-                "category": i["category"] or "",
-                "task_id": "",
-                "task": "",
-                "status": "pending",
-                "note": "",
-                "photo_drive_file_id": "",
-                "photo_sha1": "",
-                "updated_at": iso(now_utc()),
-            })
-        else:
-            for t in its:
-                items.append({
-                    "report_id": rid,
-                    "community_id": cid,
-                    "installation_id": i["installation_id"],
-                    "installation_name": i["name"],
-                    "category": i["category"] or "",
-                    "task_id": t["task_id"],
-                    "task": t["task"],
-                    "status": "pending",
-                    "note": "",
-                    "photo_drive_file_id": "",
-                    "photo_sha1": "",
-                    "updated_at": iso(now_utc()),
-                })
-    write_table("ReportItems", headers_i, items)
+        "drive_pdf_link": "",
+        "drive_docx_file_id": "",
+        "drive_docx_link": "",
+    }
+    _append_row(TAB_REPORTS, REPORTS_HEADERS, row)
     return rid
 
-def report_set_status(report_id: str, status: str) -> None:
-    headers, reps = read_table("Reports")
-    for r in reps:
-        if r.get("report_id") == report_id:
-            r["status"] = status
-            r["updated_at"] = iso(now_utc())
-            break
-    write_table("Reports", headers, reps)
+def set_report_status(report_id: str, status: str):
+    status = status.lower().strip()
+    if status not in ("draft", "final"):
+        status = "draft"
+    _update_row_by_id(TAB_REPORTS, REPORTS_HEADERS, "report_id", report_id, {"status": status, "updated_at": _now_iso()})
 
-def report_set_pdf(report_id: str, file_id: str, filename: str) -> None:
-    headers, reps = read_table("Reports")
-    for r in reps:
-        if r.get("report_id") == report_id:
-            r["drive_pdf_file_id"] = file_id
-            r["drive_pdf_filename"] = filename
-            r["updated_at"] = iso(now_utc())
-            break
-    write_table("Reports", headers, reps)
+def get_latest_draft_report(community_id: str) -> Optional[str]:
+    df = get_reports_df()
+    if df.empty:
+        return None
+    df2 = df[
+        (df["community_id"].astype(str) == str(community_id)) &
+        (df["status"].astype(str).str.lower() == "draft")
+    ].copy()
+    if df2.empty:
+        return None
+    # orden por updated_at
+    def parse_dt(x):
+        try:
+            return datetime.strptime(str(x), "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return datetime(1970, 1, 1)
+    df2["__dt"] = df2["updated_at"].apply(parse_dt)
+    df2 = df2.sort_values("__dt", ascending=False)
+    latest = df2.iloc[0]
+    # expiración
+    if parse_dt(latest["updated_at"]) < NOW() - timedelta(hours=INVITE_EXPIRY_HOURS):
+        return None
+    return str(latest["report_id"])
 
-def reportitems_for_report(report_id: str) -> List[dict]:
-    _, items = read_table("ReportItems")
-    rows = [x for x in items if x.get("report_id") == report_id]
-    # stable order: category -> installation -> task
-    def keyf(x: dict) -> tuple:
-        cat = x.get("category", "")
-        inst = x.get("installation_name", "")
-        task = x.get("task", "")
-        return (cat, inst, task)
-    rows.sort(key=keyf)
-    return rows
+def build_report_matrix(community_id: str) -> pd.DataFrame:
+    # Devuelve filas por (category, installation, task)
+    idf = get_installations_df()
+    tdf = get_tasks_df()
 
-def reportitem_update(report_id: str, installation_id: str, task_id: str, status: str, note: str,
-                      photo_drive_file_id: str = "", photo_sha1: str = "") -> None:
-    headers, items = read_table("ReportItems")
-    changed = False
-    for x in items:
-        if x.get("report_id") == report_id and x.get("installation_id") == installation_id and (x.get("task_id") or "") == (task_id or ""):
-            x["status"] = status
-            x["note"] = note
-            if photo_drive_file_id:
-                x["photo_drive_file_id"] = photo_drive_file_id
-            if photo_sha1:
-                x["photo_sha1"] = photo_sha1
-            x["updated_at"] = iso(now_utc())
-            changed = True
-            break
-    if changed:
-        write_table("ReportItems", headers, items)
+    idf = idf[idf["community_id"].astype(str) == str(community_id)].copy()
+    if idf.empty:
+        return pd.DataFrame(columns=["category", "installation", "task", "installation_id", "task_id"])
 
+    tdf = tdf.copy()
+    rows = []
+    for _, inst in idf.iterrows():
+        inst_id = inst["installation_id"]
+        cat = inst["category"]
+        inst_name = inst["installation"]
+        tasks = tdf[tdf["installation_id"].astype(str) == str(inst_id)].copy()
+        if tasks.empty:
+            rows.append({
+                "category": cat,
+                "installation": inst_name,
+                "task": "(sin tareas)",
+                "installation_id": str(inst_id),
+                "task_id": "",
+            })
+        else:
+            for _, t in tasks.iterrows():
+                rows.append({
+                    "category": cat,
+                    "installation": inst_name,
+                    "task": t["task"],
+                    "installation_id": str(inst_id),
+                    "task_id": str(t["task_id"]),
+                })
+    out = pd.DataFrame(rows)
+    # orden básico
+    out["__cat"] = out["category"].astype(str)
+    out = out.sort_values(["__cat", "installation", "task"]).drop(columns=["__cat"])
+    return out
 
-# -------------------------
-# Drive storage structure (private): Root/Communities/<cid>/Reports/<rid>/(photos,pdfs)
-# -------------------------
-def get_drive_access_token_or_raise() -> str:
-    token = get_drive_token()
-    if not token:
-        raise RuntimeError("Drive no está conectado. Conecta Drive desde Admin (bnbpartnerscommunity).")
-    token = ensure_valid_access_token(token)
-    access = token.get("access_token")
-    if not access:
-        raise RuntimeError("Token Drive inválido. Re-conecta Drive desde Admin.")
-    return access
+def load_reportitems(report_id: str) -> pd.DataFrame:
+    df = get_reportitems_df()
+    if df.empty:
+        return pd.DataFrame(columns=REPORTITEMS_HEADERS)
+    return df[df["report_id"].astype(str) == str(report_id)].copy()
 
-def drive_root_folder(access_token: str) -> str:
-    # If DRIVE_REPORTS_FOLDER_ID provided, use it; else use "root"
-    return DRIVE_REPORTS_FOLDER_ID if DRIVE_REPORTS_FOLDER_ID else "root"
-
-def drive_paths_for_report(access_token: str, community_id: str, report_id: str) -> Tuple[str, str]:
-    root = drive_root_folder(access_token)
-    comms = drive_ensure_folder(access_token, root, "Communities")
-    cfold = drive_ensure_folder(access_token, comms, community_id)
-    reps = drive_ensure_folder(access_token, cfold, "Reports")
-    rfold = drive_ensure_folder(access_token, reps, report_id)
-    photos = drive_ensure_folder(access_token, rfold, "photos")
-    pdfs = drive_ensure_folder(access_token, rfold, "pdfs")
-    return photos, pdfs
-
-def upload_photo_private(access_token: str, photos_folder_id: str, filename: str, mime: str, data: bytes) -> str:
-    meta = {"name": filename, "parents": [photos_folder_id]}
-    created = drive_files_create(access_token, meta, media=data, mime=mime)
-    return created["id"]
-
-def upload_pdf_private(access_token: str, pdfs_folder_id: str, filename: str, data: bytes) -> str:
-    meta = {"name": filename, "parents": [pdfs_folder_id]}
-    created = drive_files_create(access_token, meta, media=data, mime="application/pdf")
-    return created["id"]
+def save_reportitems(report_id: str, items_df: pd.DataFrame):
+    # Sobrescribe todas las filas del report_id (simple y robusto para testing)
+    all_df = get_reportitems_df()
+    other = all_df[all_df["report_id"].astype(str) != str(report_id)].copy()
+    combined = pd.concat([other, items_df], ignore_index=True)
+    _df_to_sheet_overwrite(TAB_REPORTITEMS, REPORTITEMS_HEADERS, combined)
+    _update_row_by_id(TAB_REPORTS, REPORTS_HEADERS, "report_id", report_id, {"updated_at": _now_iso()})
 
 
-# -------------------------
-# PDF export (3 columns visual)
-# -------------------------
-def status_badge(status: str) -> str:
-    s = (status or "").lower()
-    if s == "ok":
-        return "OK"
+# ============================================================
+# EXPORT: PDF (ReportLab) / WORD (python-docx)
+# ============================================================
+
+def _status_label(s: str) -> str:
+    s = (s or "").lower().strip()
+    return {"ok": "OK", "fail": "FALLA", "pending": "PEND."}.get(s, "PEND.")
+
+def _status_color_bg(s: str):
+    s = (s or "").lower().strip()
     if s == "fail":
-        return "FALLA"
-    return "PEND."
-
-def status_color_bg(status: str):
-    s = (status or "").lower()
-    if s == "fail":
-        return colors.Color(1, 0.9, 0.9)  # soft red
+        return colors.Color(1, 0.93, 0.93)  # rojo suave
     if s == "ok":
-        return colors.Color(0.92, 0.98, 0.92)  # soft green
+        return colors.Color(0.93, 1, 0.93)  # verde suave
     return colors.whitesmoke
 
-def build_pdf_bytes(
-    *,
+def export_pdf_visual(
     community_name: str,
-    report_id: str,
-    created_by: str,
-    created_at_iso: str,
-    items: List[dict],
-    drive_access_token: str,
+    report_date_str: str,
+    rows: List[dict],
 ) -> bytes:
-    # counts
-    okc = sum(1 for i in items if (i.get("status") or "").lower() == "ok")
-    failc = sum(1 for i in items if (i.get("status") or "").lower() == "fail")
-    pendc = sum(1 for i in items if (i.get("status") or "").lower() == "pending")
-
+    # rows: [{category, installation, task, status, note, photo_bytes|None, photo_mime}]
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
         buf,
@@ -946,808 +874,1081 @@ def build_pdf_bytes(
         rightMargin=12 * mm,
         topMargin=12 * mm,
         bottomMargin=12 * mm,
-        title=f"Informe {community_name} {report_id}",
-        author="Control Comunidades",
     )
 
     styles = getSampleStyleSheet()
-    h1 = styles["Heading1"]
-    h2 = styles["Heading2"]
-    normal = styles["BodyText"]
-
-    story = []
-    story.append(Paragraph(f"🛡️ <b>Informe de Inspección</b> — {community_name}", h1))
-    story.append(Paragraph(f"<b>ID:</b> {report_id} &nbsp;&nbsp; <b>Creado por:</b> {created_by} &nbsp;&nbsp; <b>Fecha:</b> {created_at_iso}", normal))
-    story.append(Spacer(1, 6 * mm))
-
-    # summary cards (simple table)
-    summary = [
-        ["Sistemas OK", str(okc), "Fallas", str(failc), "Pend.", str(pendc)]
-    ]
-    t = Table(summary, colWidths=[30*mm, 15*mm, 25*mm, 15*mm, 18*mm, 15*mm])
-    t.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (1,0), colors.Color(0.92, 0.98, 0.92)),
-        ("BACKGROUND", (2,0), (3,0), colors.Color(1, 0.9, 0.9)),
-        ("BACKGROUND", (4,0), (5,0), colors.whitesmoke),
-        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
-        ("ALIGN", (1,0), (1,0), "CENTER"),
-        ("ALIGN", (3,0), (3,0), "CENTER"),
-        ("ALIGN", (5,0), (5,0), "CENTER"),
-        ("BOX", (0,0), (-1,0), 0.6, colors.lightgrey),
-        ("INNERGRID", (0,0), (-1,0), 0.6, colors.lightgrey),
-        ("VALIGN", (0,0), (-1,0), "MIDDLE"),
-    ]))
-    story.append(t)
-    story.append(Spacer(1, 6 * mm))
-
-    story.append(Paragraph("Checklist Técnico (Categoría / Instalación / Tarea)", h2))
-    story.append(Spacer(1, 3 * mm))
-
-    # group by category
-    def cat_rank(cat: str) -> int:
-        if cat in CATEGORY_ORDER:
-            return CATEGORY_ORDER.index(cat)
-        return 999
-
-    items_sorted = sorted(items, key=lambda x: (cat_rank(x.get("category","")), x.get("category",""), x.get("installation_name",""), x.get("task","")))
-
-    # build rows for table 3 columns
-    data_rows = []
-    # header row
-    data_rows.append(["Categoría / Instalación / Tarea", "Estado y observación", "Foto"])
-
-    # photo sizing
-    max_w = 55 * mm
-    max_h = 32 * mm
-
-    for it in items_sorted:
-        cat = it.get("category", "")
-        inst = it.get("installation_name", "")
-        task = it.get("task", "") or "(Sin tarea)"
-        status = it.get("status", "pending")
-        note = it.get("note", "") or ""
-        badge = status_badge(status)
-
-        left_txt = f"<b>{cat}</b><br/>{inst}<br/><font size=9>{task}</font>"
-        mid_txt = f"<b>{badge}</b><br/><font size=9>{note or 'Sin observaciones.'}</font>"
-
-        # photo cell
-        img_flow = ""
-        pid = it.get("photo_drive_file_id", "")
-        if pid:
-            try:
-                img_bytes = drive_files_get_media(drive_access_token, pid)
-                img_buf = io.BytesIO(img_bytes)
-                rlimg = RLImage(img_buf)
-                rlimg._restrictSize(max_w, max_h)
-                img_flow = rlimg
-            except Exception:
-                img_flow = Paragraph("<font size=8 color='grey'>(Foto no disponible)</font>", normal)
-        else:
-            img_flow = Paragraph("<font size=8 color='grey'>(Sin foto)</font>", normal)
-
-        data_rows.append([Paragraph(left_txt, normal), Paragraph(mid_txt, normal), img_flow])
-
-    table = Table(
-        data_rows,
-        colWidths=[80*mm, 60*mm, 55*mm],
-        repeatRows=1
+    title_style = ParagraphStyle(
+        "title",
+        parent=styles["Heading1"],
+        fontSize=16,
+        leading=20,
+        alignment=TA_LEFT,
     )
-    # style with soft-red background for FAIL rows
-    ts = [
-        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
-        ("BACKGROUND", (0,0), (-1,0), colors.Color(0.95,0.95,0.98)),
-        ("BOX", (0,0), (-1,-1), 0.6, colors.lightgrey),
-        ("INNERGRID", (0,0), (-1,-1), 0.4, colors.lightgrey),
-        ("VALIGN", (0,0), (-1,-1), "TOP"),
-        ("ALIGN", (2,1), (2,-1), "CENTER"),
-    ]
+    meta_style = ParagraphStyle(
+        "meta",
+        parent=styles["Normal"],
+        fontSize=10,
+        leading=13,
+    )
 
-    # row backgrounds by status
-    for row_idx in range(1, len(data_rows)):
-        stval = (items_sorted[row_idx-1].get("status") or "pending").lower()
-        bg = status_color_bg(stval)
-        ts.append(("BACKGROUND", (0,row_idx), (-1,row_idx), bg))
+    flow = []
+    flow.append(Paragraph(f"{APP_NAME} — Informe", title_style))
+    flow.append(Paragraph(f"<b>Comunidad:</b> {community_name}", meta_style))
+    flow.append(Paragraph(f"<b>Fecha informe:</b> {report_date_str}", meta_style))
+    flow.append(Spacer(1, 8))
 
-    table.setStyle(TableStyle(ts))
-    story.append(table)
-    story.append(Spacer(1, 3 * mm))
-    story.append(Paragraph("<font size=8 color='grey'>Documento generado por Control Comunidades • PDF privado en Drive (Mi unidad).</font>", normal))
+    # Header table
+    data = [["Categoría / Instalación / Tarea", "Estado / Observación", "Foto"]]
 
-    doc.build(story)
+    # Build cells
+    for r in rows:
+        left = f"<b>{r['category']}</b><br/>{r['installation']}<br/><i>{r['task']}</i>"
+        mid = f"<b>{_status_label(r.get('status'))}</b><br/>{(r.get('note') or '').strip() or '—'}"
+        img_cell = "—"
+        if r.get("photo_bytes"):
+            try:
+                img = Image.open(io.BytesIO(r["photo_bytes"]))
+                img = img.convert("RGB")
+                img.thumbnail((240, 240))
+                ib = io.BytesIO()
+                img.save(ib, format="JPEG", quality=85)
+                ib.seek(0)
+                img_cell = RLImage(ib, width=55 * mm, height=55 * mm)  # cuadrado
+            except Exception:
+                img_cell = "Foto inválida"
+
+        data.append([Paragraph(left, meta_style), Paragraph(mid, meta_style), img_cell])
+
+    table = Table(data, colWidths=[70 * mm, 60 * mm, 55 * mm])
+    ts = TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f2937")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, 0), 10),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e5e7eb")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#fafafa")]),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ])
+
+    # Fallas con fondo rojo suave
+    for i, r in enumerate(rows, start=1):
+        bg = _status_color_bg(r.get("status"))
+        ts.add("BACKGROUND", (0, i), (-1, i), bg)
+
+    table.setStyle(ts)
+    flow.append(table)
+
+    doc.build(flow)
     return buf.getvalue()
 
+def export_docx_visual(
+    community_name: str,
+    report_date_str: str,
+    rows: List[dict],
+) -> bytes:
+    doc = Document()
+    doc.add_heading(f"{APP_NAME} — Informe", level=1)
+    doc.add_paragraph(f"Comunidad: {community_name}")
+    doc.add_paragraph(f"Fecha informe: {report_date_str}")
 
-# -------------------------
-# UI pieces
-# -------------------------
-def ui_drive_connect_admin(current_user: str) -> None:
-    st.subheader("🔌 Conectar Drive (Mi unidad) — Solo Admin")
-    if not user_is_admin(current_user) or not is_bootstrap_admin(current_user):
-        st.info("Solo admins bootstrap pueden conectar Drive (bnbpartnerscommunity, etc.).")
-        return
+    doc.add_paragraph("")
 
-    token = get_drive_token()
-    if token:
-        token2 = ensure_valid_access_token(token)
-        if token2.get("access_token"):
-            st.success("Drive ya está conectado ✅")
+    table = doc.add_table(rows=1, cols=3)
+    hdr = table.rows[0].cells
+    hdr[0].text = "Categoría / Instalación / Tarea"
+    hdr[1].text = "Estado / Observación"
+    hdr[2].text = "Foto"
+
+    for r in rows:
+        row_cells = table.add_row().cells
+        row_cells[0].text = f"{r['category']}\n{r['installation']}\n{r['task']}"
+        row_cells[1].text = f"{_status_label(r.get('status'))}\n{(r.get('note') or '').strip() or '—'}"
+        if r.get("photo_bytes"):
+            try:
+                img = Image.open(io.BytesIO(r["photo_bytes"]))
+                img = img.convert("RGB")
+                img.thumbnail((600, 600))
+                ib = io.BytesIO()
+                img.save(ib, format="JPEG", quality=85)
+                ib.seek(0)
+                run = row_cells[2].paragraphs[0].add_run()
+                run.add_picture(ib, width=Inches(1.8))
+            except Exception:
+                row_cells[2].text = "Foto inválida"
         else:
-            st.warning("Hay token guardado pero inválido. Re-conecta.")
-    else:
-        st.warning("Drive NO está conectado aún.")
+            row_cells[2].text = "—"
 
-    q = st.query_params
-    code = q.get("code")
-    if code:
-        try:
-            tok = exchange_code_for_token(code)
-            tok["created_at"] = int(time.time())
-            save_drive_token(tok)
-            st.success("Conexión Drive exitosa ✅ (token cifrado guardado en Sheets/AppConfig)")
+    out = io.BytesIO()
+    doc.save(out)
+    return out.getvalue()
+
+
+# ============================================================
+# MASTER DATA TEMPLATE (xlsx)
+# ============================================================
+
+def build_master_template_xlsx() -> bytes:
+    # Plantilla: Community | Category | Installation | Task
+    from openpyxl import Workbook
+    from openpyxl.worksheet.datavalidation import DataValidation
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "MasterData"
+    ws.append(["CommunityName", "Category", "Installation", "Task"])
+    ws.append(["Ej: Comunidad A", "Críticos", "Sala de Bombas", "Presión y alternancia"])
+
+    # Data validation for Category
+    dv = DataValidation(type="list", formula1='"{}"'.format(",".join(CATEGORIES_DEFAULT)), allow_blank=False)
+    ws.add_data_validation(dv)
+    dv.add("B2:B500")
+
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+def import_master_template_xlsx(file_bytes: bytes, target_community_id: str, replace_all: bool):
+    from openpyxl import load_workbook
+    wb = load_workbook(io.BytesIO(file_bytes), data_only=True)
+    if "MasterData" not in wb.sheetnames:
+        raise RuntimeError("La plantilla debe tener una hoja llamada 'MasterData'.")
+    ws = wb["MasterData"]
+
+    rows = []
+    for i, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+        community_name, category, installation, task = row
+        if not community_name and not category and not installation and not task:
+            continue
+        category = (category or "Otros").strip()
+        installation = (installation or "").strip()
+        task = (task or "").strip()
+        if not installation:
+            continue
+        rows.append((category, installation, task))
+
+    if replace_all:
+        # elimina instalaciones + tareas de esa comunidad y vuelve a crear
+        idf = get_installations_df()
+        inst_ids = idf[idf["community_id"].astype(str) == str(target_community_id)]["installation_id"].astype(str).tolist()
+        idf = idf[idf["community_id"].astype(str) != str(target_community_id)].copy()
+        _df_to_sheet_overwrite(TAB_INSTALLATIONS, INSTALLATIONS_HEADERS, idf)
+
+        tdf = get_tasks_df()
+        if inst_ids:
+            tdf = tdf[~tdf["installation_id"].astype(str).isin(inst_ids)].copy()
+            _df_to_sheet_overwrite(TAB_TASKS, TASKS_HEADERS, tdf)
+
+    # upsert
+    for category, installation, task in rows:
+        inst_id = upsert_installation(target_community_id, category, installation)
+        if task:
+            upsert_task(inst_id, task)
+
+
+# ============================================================
+# OAUTH UI (Drive)
+# ============================================================
+
+def drive_oauth_ui(user: dict):
+    st.sidebar.markdown("### 🧩 Drive (Mi unidad)")
+    creds = _get_drive_creds_from_state()
+    if creds:
+        st.sidebar.success("Drive conectado (OAuth).")
+        if st.sidebar.button("Desconectar Drive", use_container_width=True):
+            st.session_state.pop("drive_oauth_token", None)
             st.query_params.clear()
             st.rerun()
-        except Exception as e:
-            st.error("Error al conectar Drive.")
-            st.exception(e)
-            return
-
-    st.caption("Inicia sesión con bnbpartnerscommunity y autoriza. Esto habilita subir fotos y PDFs a Mi unidad de esa cuenta.")
-    state = secrets.token_urlsafe(16)
-    st.link_button("Conectar Drive con bnbpartnerscommunity", build_oauth_auth_url(state))
-
-
-def ui_access_gate() -> Tuple[str, bool]:
-    st.title("🛡️ Control Comunidades — Acceso")
-
-    with st.expander("¿Qué debo ingresar?", expanded=True):
-        st.write(
-            "- **Email**: tu correo (cualquiera). \n"
-            "- Si eres **usuario nuevo**, debes tener un **código de invitación** (lo crea un admin).\n"
-            "- Si ya estás registrado, entras solo con tu email.\n"
-        )
-
-    email = st.text_input("Tu email", placeholder="tu.nombre@empresa.com").strip()
-    invite_code = st.text_input("Código de invitación (solo si eres nuevo)", placeholder="Ej: AbC123...").strip()
-
-    login = st.button("Entrar", type="primary", use_container_width=True)
-    if not login:
-        return "", False
-
-    if not email or "@" not in email:
-        st.error("Ingresa un email válido.")
-        return "", False
-
-    em = norm_email(email)
-
-    # bootstrap always allowed and created
-    if is_bootstrap_admin(em):
-        ensure_user_exists(em, display_name=em.split("@")[0])
-        st.session_state["user_email"] = em
-        return em, True
-
-    # existing user?
-    u = user_get(em)
-    if u:
-        st.session_state["user_email"] = em
-        return em, True
-
-    # new user: must have valid invite
-    if not invite_code:
-        st.error("Usuario nuevo: necesitas un código de invitación.")
-        return "", False
-
-    if not invite_use(em, invite_code):
-        st.error("Código inválido / expirado / ya usado.")
-        return "", False
-
-    ensure_user_exists(em, display_name=em.split("@")[0])
-    st.session_state["user_email"] = em
-    st.success("Registro exitoso ✅")
-    return em, True
-
-
-def ui_admin_users(current_user: str) -> None:
-    st.header("👤 Módulo Usuarios (Admin)")
-
-    # Create invite (and user)
-    st.subheader("Invitar / registrar usuario")
-    with st.form("invite_form", clear_on_submit=True):
-        target = st.text_input("Email del usuario", placeholder="usuario@dominio.com")
-        display_name = st.text_input("Nombre (opcional)", placeholder="Juan Pérez")
-        make_admin = st.checkbox("Marcar como administrador", value=False)
-        create = st.form_submit_button("Crear invitación", type="primary")
-        if create:
-            if not target or "@" not in target:
-                st.error("Email inválido.")
-            else:
-                tgt = norm_email(target)
-                # create invite
-                code = invite_create(tgt, current_user)
-                ensure_user_exists(tgt, display_name=display_name.strip() if display_name else "")
-                # set admin flag if requested
-                if make_admin:
-                    h, users = read_table("Users")
-                    for u in users:
-                        if norm_email(u.get("email","")) == tgt:
-                            u["is_admin"] = "true"
-                            break
-                    write_table("Users", h, users)
-                st.success("Invitación creada ✅ Copia el código y envíaselo al usuario.")
-                st.code(code)
-
-    st.divider()
-
-    # Assign access
-    st.subheader("Asignar comunidades y permisos")
-    _, users = read_table("Users")
-    users = [u for u in users if u.get("active", "true").lower() == "true"]
-    user_emails = [u["email"] for u in users]
-    pick = st.selectbox("Selecciona usuario", options=user_emails)
-
-    is_admin_flag = (norm_email(pick) in BOOTSTRAP_ADMIN_EMAILS) or (user_get(pick) and user_get(pick).get("is_admin","").lower()=="true")
-    st.caption(f"Admin: {'sí' if is_admin_flag else 'no'}")
-
-    comms = list_communities(active_only=True)
-    comm_options = {f"{c['name']} ({c['community_id']})": c["community_id"] for c in comms}
-    selected = st.multiselect("Comunidades asignadas", options=list(comm_options.keys()))
-
-    if is_admin_flag:
-        st.info("Usuario admin: permisos completos (crear informes + ver resumen).")
-        role = "admin"
-        can_create = True
-        can_view = True
-    else:
-        role = st.selectbox("Rol (informativo)", options=["Supervisor", "Mantenedor", "Analista Interno", "Conserje", "Viewer"], index=0)
-        can_create = st.checkbox("Permiso: crear informes (Módulo Informes)", value=True)
-        can_view = st.checkbox("Permiso: ver resumen (Módulo Resumen)", value=True)
-
-    if st.button("Guardar asignaciones", type="primary"):
-        # deactivate all user access first (non-admin) then set selected active
-        # (admins can also be restricted by selection if you want; here we set selected too)
-        h, acc = read_table("UserCommunityAccess")
-        for a in acc:
-            if norm_email(a.get("email","")) == norm_email(pick):
-                a["active"] = "false"
-        write_table("UserCommunityAccess", h, acc)
-
-        for label in selected:
-            cid = comm_options[label]
-            set_user_access(pick, cid, role, can_create, can_view, active=True)
-        st.success("Permisos guardados ✅")
-        st.rerun()
-
-    st.divider()
-
-    # Delete user (hard)
-    st.subheader("🗑️ Eliminar usuario definitivamente")
-    non_bootstrap = [u for u in users if norm_email(u["email"]) not in BOOTSTRAP_ADMIN_EMAILS]
-    if not non_bootstrap:
-        st.info("No hay usuarios eliminables (solo bootstrap).")
-    else:
-        tgt = st.selectbox("Usuario a eliminar", options=[u["email"] for u in non_bootstrap])
-        confirm = st.text_input("Escribe ELIMINAR para confirmar", key="del_user_confirm")
-        if st.button("Eliminar usuario", type="primary"):
-            if confirm.strip().upper() != "ELIMINAR":
-                st.error("Debes escribir ELIMINAR.")
-            else:
-                # Users
-                h, users2 = read_table("Users")
-                users2 = [u for u in users2 if norm_email(u.get("email","")) != norm_email(tgt)]
-                write_table("Users", h, users2)
-                # Access
-                h, acc2 = read_table("UserCommunityAccess")
-                acc2 = [a for a in acc2 if norm_email(a.get("email","")) != norm_email(tgt)]
-                write_table("UserCommunityAccess", h, acc2)
-                # Invites
-                h, inv = read_table("Invites")
-                inv = [i for i in inv if norm_email(i.get("email","")) != norm_email(tgt)]
-                write_table("Invites", h, inv)
-                st.success("Usuario eliminado ✅")
-                st.rerun()
-
-
-def ui_admin_communities(current_user: str) -> None:
-    st.header("🏢 Módulo Comunidades (Admin)")
-
-    st.subheader("Crear comunidad")
-    with st.form("new_comm", clear_on_submit=True):
-        name = st.text_input("Nombre de la comunidad", placeholder="Edificio A / Comunidad X")
-        create = st.form_submit_button("Crear", type="primary")
-        if create:
-            if not name.strip():
-                st.error("Nombre requerido.")
-            else:
-                cid = community_create(name.strip())
-                st.success(f"Comunidad creada ✅ ({cid})")
-                st.rerun()
-
-    st.divider()
-
-    comms = list_communities(active_only=False)
-    if not comms:
-        st.info("No hay comunidades aún.")
         return
 
-    opt = {f"{c['name']} ({c['community_id']})": c["community_id"] for c in comms}
-    pick_label = st.selectbox("Selecciona comunidad", options=list(opt.keys()))
-    cid = opt[pick_label]
-    cobj = next(c for c in comms if c["community_id"] == cid)
-    st.caption(f"Activo: {cobj.get('active','true')} • Creado: {cobj.get('created_at','')}")
-
-    # Installations manager
-    st.subheader("Instalaciones")
-    inst = installations_for_community(cid)
-    if inst:
-        for i in inst:
-            with st.container(border=True):
-                c1, c2, c3 = st.columns([2, 2, 1])
-                c1.write(f"**{i['name']}**")
-                c2.write(i.get("category",""))
-                if c3.button("Desactivar", key=f"deact_inst_{i['installation_id']}"):
-                    installation_deactivate(i["installation_id"])
-                    st.rerun()
-    else:
-        st.info("Sin instalaciones activas.")
-
-    with st.form("add_inst", clear_on_submit=True):
-        cat = st.selectbox("Tipo/Categoría", options=["Críticos","Infraestructura","Espacio Común","Accesos","Higiene","Comunes","Infra"])
-        name = st.text_input("Nombre instalación", placeholder="Sala de Bombas / Ascensores / Piscina ...")
-        add = st.form_submit_button("Agregar instalación", type="primary")
-        if add:
-            if not name.strip():
-                st.error("Nombre requerido.")
-            else:
-                installation_add(cid, cat, name.strip())
-                st.success("Instalación agregada ✅")
-                st.rerun()
-
-    st.divider()
-
-    # Tasks manager
-    st.subheader("Tareas por instalación")
-    inst2 = installations_for_community(cid)
-    if not inst2:
-        st.warning("Agrega instalaciones primero.")
-    else:
-        inst_map = {f"{i['name']} ({i['installation_id']})": i["installation_id"] for i in inst2}
-        pick_inst = st.selectbox("Instalación", options=list(inst_map.keys()))
-        iid = inst_map[pick_inst]
-
-        tsk = [t for t in tasks_for_community(cid) if t.get("installation_id") == iid]
-        if tsk:
-            for t in tsk:
-                with st.container(border=True):
-                    c1, c2 = st.columns([5,1])
-                    c1.write(t.get("task",""))
-                    if c2.button("Desactivar", key=f"deact_task_{t['task_id']}"):
-                        task_deactivate(t["task_id"])
-                        st.rerun()
-        else:
-            st.info("Sin tareas activas para esta instalación.")
-
-        with st.form("add_task", clear_on_submit=True):
-            task = st.text_input("Nueva tarea", placeholder="Ej: Revisar presión / Alternancia / Fugas ...")
-            addt = st.form_submit_button("Agregar tarea", type="primary")
-            if addt:
-                if not task.strip():
-                    st.error("Tarea requerida.")
-                else:
-                    task_add(cid, iid, task.strip())
-                    st.success("Tarea agregada ✅")
-                    st.rerun()
-
-    st.divider()
-
-    # Hard delete community
-    with st.expander("🗑️ Eliminar comunidad definitivamente"):
-        st.warning("Esto borra datos en Sheets (comunidad+instalaciones+tareas+reportes). No borra archivos en Drive.")
-        confirm = st.text_input("Escribe ELIMINAR para confirmar", key=f"del_comm_confirm_{cid}")
-        if st.button("Eliminar comunidad", type="primary"):
-            if confirm.strip().upper() != "ELIMINAR":
-                st.error("Debes escribir ELIMINAR.")
-            else:
-                community_delete(cid)
-                st.success("Comunidad eliminada ✅")
-                st.rerun()
-
-
-def ui_reports(current_user: str) -> None:
-    st.header("🧾 Módulo Informes")
-
-    allowed = user_allowed_communities(current_user)
-    if not allowed:
-        st.warning("No tienes comunidades asignadas.")
+    if user.get("role") != ROLE_ADMIN:
+        st.sidebar.info("Solo Admin conecta Drive.")
         return
 
-    comms = [c for c in list_communities(active_only=True) if c["community_id"] in allowed]
-    opt = {f"{c['name']} ({c['community_id']})": c["community_id"] for c in comms}
-    pick_label = st.selectbox("Elige comunidad", options=list(opt.keys()))
-    cid = opt[pick_label]
-    cname = next(c["name"] for c in comms if c["community_id"] == cid)
+    st.sidebar.warning("Drive NO conectado.")
 
-    # permission to create?
-    can_create = user_is_admin(current_user)
-    if not can_create:
-        for a in access_list_for_user(current_user):
-            if a.get("community_id") == cid and a.get("can_create_reports","false").lower() == "true":
-                can_create = True
-                break
-    if not can_create:
-        st.error("No tienes permiso para crear/editar informes en esta comunidad.")
-        return
-
-    st.subheader("Crear nuevo / Continuar Draft")
-    reps = reports_for_community(cid)
-    last_draft = next((r for r in reps if (r.get("status") or "") == "Draft"), None)
-
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("➕ Crear nuevo informe", type="primary"):
-            rid = report_create(cid, cname, current_user)
-            st.session_state["active_report_id"] = rid
-            st.success(f"Informe creado: {rid}")
+    # Handle redirect callback
+    qp = st.query_params
+    code = qp.get("code")
+    if code:
+        try:
+            flow = Flow.from_client_config(
+                _oauth_client_config(),
+                scopes=DRIVE_SCOPES,
+                redirect_uri=OAUTH_REDIRECT_URI,
+            )
+            flow.fetch_token(code=code)
+            creds = flow.credentials
+            st.session_state["drive_oauth_token"] = json.loads(creds.to_json())
+            st.query_params.clear()
+            st.sidebar.success("Drive conectado ✅")
             st.rerun()
+        except Exception as e:
+            st.sidebar.error(f"Error OAuth: {e}")
+            st.query_params.clear()
 
-    with c2:
-        if last_draft:
-            if st.button(f"📝 Continuar Draft ({last_draft['report_id']})"):
-                st.session_state["active_report_id"] = last_draft["report_id"]
-                st.rerun()
-        else:
-            st.info("No hay Draft existente.")
+    if not (OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET and OAUTH_REDIRECT_URI):
+        st.sidebar.error("Faltan secrets OAuth (OAUTH_CLIENT_ID/SECRET/REDIRECT_URI).")
+        return
 
-    rid = st.session_state.get("active_report_id", "")
-    if not rid:
-        st.stop()
+    if st.sidebar.button("Conectar Drive (OAuth)", use_container_width=True):
+        flow = Flow.from_client_config(
+            _oauth_client_config(),
+            scopes=DRIVE_SCOPES,
+            redirect_uri=OAUTH_REDIRECT_URI,
+        )
+        auth_url, _ = flow.authorization_url(
+            access_type="offline",
+            include_granted_scopes="true",
+            prompt="consent",
+        )
+        st.sidebar.markdown("Abre este enlace para autorizar:")
+        st.sidebar.markdown(auth_url)
 
-    rep = report_get(rid)
-    if not rep or rep.get("community_id") != cid:
-        st.warning("Informe activo no corresponde a esta comunidad. Selecciona nuevamente.")
-        st.session_state["active_report_id"] = ""
-        st.stop()
 
-    st.divider()
-    st.subheader(f"Informe: {rid} — Estado: {rep.get('status','Draft')}")
+# ============================================================
+# UI: HEADER
+# ============================================================
 
-    # If Final: do not allow edits, only download
-    if rep.get("status") == "Final":
-        st.info("Este informe está FINAL. Puedes descargarlo desde Resumen.")
-        st.stop()
-
-    # Drive token needed only when uploading photos / generating final pdf
-    drive_ready = True
-    try:
-        drive_access = get_drive_access_token_or_raise()
-    except Exception:
-        drive_ready = False
-        drive_access = ""
-
-    if not drive_ready:
-        st.warning("Drive NO está conectado. Las fotos y el PDF final requieren que el admin conecte Drive.")
-        st.caption("Un admin bootstrap debe ir a Admin → Conectar Drive, iniciar sesión con bnbpartnerscommunity y autorizar.")
-
-    items = reportitems_for_report(rid)
-
-    # Summary cards (header)
-    okc = sum(1 for i in items if (i.get("status") or "").lower() == "ok")
-    failc = sum(1 for i in items if (i.get("status") or "").lower() == "fail")
-    pendc = sum(1 for i in items if (i.get("status") or "").lower() == "pending")
+def header_card(ok: int, fail: int, pending: int):
     st.markdown(
         f"""
-        <div style="display:flex; gap:12px; flex-wrap:wrap;">
-          <div style="padding:10px 14px; border-radius:14px; background:#ecfdf5; border:1px solid #bbf7d0;">
-            <div style="font-size:11px; opacity:0.7;">SISTEMAS OK</div>
-            <div style="font-size:22px; font-weight:800; color:#16a34a;">{okc}</div>
-          </div>
-          <div style="padding:10px 14px; border-radius:14px; background:#fef2f2; border:1px solid #fecaca;">
-            <div style="font-size:11px; opacity:0.7;">FALLAS</div>
-            <div style="font-size:22px; font-weight:800; color:#dc2626;">{failc}</div>
-          </div>
-          <div style="padding:10px 14px; border-radius:14px; background:#f8fafc; border:1px solid #e2e8f0;">
-            <div style="font-size:11px; opacity:0.7;">PENDIENTES</div>
-            <div style="font-size:22px; font-weight:800; color:#334155;">{pendc}</div>
+        <div style="padding:18px 18px 12px 18px; border-radius:16px;
+                    background: linear-gradient(90deg, #111827, #1f2937);
+                    color:white;">
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:16px; flex-wrap:wrap;">
+            <div>
+              <div style="font-size:22px; font-weight:900;">{APP_NAME}</div>
+              <div style="opacity:0.85;">Sheets (DB) + Drive (export) • esquema Tasks/Reports</div>
+            </div>
+            <div style="display:flex; gap:14px;">
+              <div style="background: rgba(255,255,255,0.08); padding:10px 14px; border-radius:12px; text-align:center; min-width:110px;">
+                <div style="font-size:11px; letter-spacing:0.08em; opacity:0.8;">OK</div>
+                <div style="font-size:22px; font-weight:900; color:#34d399;">{ok}</div>
+              </div>
+              <div style="background: rgba(255,255,255,0.08); padding:10px 14px; border-radius:12px; text-align:center; min-width:110px;">
+                <div style="font-size:11px; letter-spacing:0.08em; opacity:0.8;">FALLAS</div>
+                <div style="font-size:22px; font-weight:900; color:#fb7185;">{fail}</div>
+              </div>
+              <div style="background: rgba(255,255,255,0.08); padding:10px 14px; border-radius:12px; text-align:center; min-width:110px;">
+                <div style="font-size:11px; letter-spacing:0.08em; opacity:0.8;">PEND.</div>
+                <div style="font-size:22px; font-weight:900; color:#fbbf24;">{pending}</div>
+              </div>
+            </div>
           </div>
         </div>
         """,
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
     )
 
-    st.write("")
-    st.caption("Completa estado/observación. Si subes foto, se guarda privada en Drive (Mi unidad de bnbpartnerscommunity).")
 
-    # Render checklist grouped
-    last_cat = None
-    for it in items:
-        cat = it.get("category", "") or "Sin categoría"
-        if cat != last_cat:
-            st.markdown(f"### {cat}")
-            last_cat = cat
+# ============================================================
+# UI: LOGIN SCREEN
+# ============================================================
 
-        with st.container(border=True):
-            colA, colB, colC = st.columns([2.2, 2.4, 1.6], gap="large")
-            with colA:
-                st.markdown(f"**{it.get('installation_name','')}**")
-                st.caption(it.get("task","") or "(Sin tarea)")
-            with colB:
-                status = st.radio(
-                    "Estado",
-                    options=["pending", "ok", "fail"],
-                    index=["pending","ok","fail"].index((it.get("status") or "pending").lower()),
-                    horizontal=True,
-                    label_visibility="collapsed",
-                    key=f"st_{rid}_{it['installation_id']}_{it.get('task_id','')}",
-                )
-                note = st.text_input(
-                    "Observación",
-                    value=it.get("note",""),
-                    placeholder="Observación breve…",
-                    label_visibility="collapsed",
-                    key=f"nt_{rid}_{it['installation_id']}_{it.get('task_id','')}",
-                )
+def login_screen():
+    st.title(f"{APP_NAME} — Acceso")
+    st.caption("Acceso seguro por invitación (Admin) + contraseña. Bootstrap admins protegidos por token de setup.")
 
-                # persist status/note
-                if status != it.get("status") or note != it.get("note",""):
-                    reportitem_update(
-                        rid,
-                        it["installation_id"],
-                        it.get("task_id",""),
-                        status=status,
-                        note=note,
-                    )
+    ensure_schema()
 
-            with colC:
-                # soft fail background hint
-                if status == "fail":
-                    st.markdown("<div style='padding:6px 10px; border-radius:10px; background:#fef2f2; border:1px solid #fecaca; color:#991b1b; font-weight:700;'>🔴 FALLA</div>", unsafe_allow_html=True)
-                elif status == "ok":
-                    st.markdown("<div style='padding:6px 10px; border-radius:10px; background:#ecfdf5; border:1px solid #bbf7d0; color:#166534; font-weight:700;'>🟢 OK</div>", unsafe_allow_html=True)
+    if _bootstrap_needed():
+        st.warning("⚙️ Bootstrap requerido (no hay usuarios en la base).")
+        with st.form("bootstrap_form"):
+            token = st.text_input("BOOTSTRAP_SETUP_TOKEN", type="password")
+            submit = st.form_submit_button("Crear Admins iniciales")
+        if submit:
+            try:
+                _bootstrap_create_admins(token)
+                st.success("Admins bootstrap creados. Ahora inicia sesión y define contraseña.")
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
+        st.stop()
+
+    colA, colB = st.columns([1, 1])
+
+    with colA:
+        st.subheader("👤 Iniciar sesión")
+        with st.form("login_form"):
+            email = st.text_input("Email", placeholder="usuario@empresa.com")
+            password = st.text_input("Contraseña", type="password")
+            submit = st.form_submit_button("Entrar")
+
+        if submit:
+            user = _verify_password(email, password)
+            if not user:
+                st.error("Credenciales inválidas.")
+            else:
+                # Si no tiene password aún, forzamos setear
+                if not _user_has_password(user):
+                    st.session_state["pw_setup_email"] = _norm_email(email)
+                    st.success("Primer ingreso: define una contraseña.")
                 else:
-                    st.markdown("<div style='padding:6px 10px; border-radius:10px; background:#f8fafc; border:1px solid #e2e8f0; color:#334155; font-weight:700;'>⚪ PEND.</div>", unsafe_allow_html=True)
+                    _login_user(user.to_dict())
+                    st.rerun()
 
-                up = st.file_uploader(
-                    "Foto (opcional)",
-                    type=["jpg","jpeg","png"],
-                    key=f"ph_{rid}_{it['installation_id']}_{it.get('task_id','')}",
-                    label_visibility="collapsed",
-                )
-                if up is not None:
-                    file_bytes = up.getvalue()
-                    sha1 = hashlib.sha1(file_bytes).hexdigest()
+        if "pw_setup_email" in st.session_state:
+            st.info(f"Define contraseña para: {st.session_state['pw_setup_email']}")
+            with st.form("set_pw_form"):
+                p1 = st.text_input("Nueva contraseña", type="password")
+                p2 = st.text_input("Repite contraseña", type="password")
+                ok = st.form_submit_button("Guardar contraseña")
+            if ok:
+                if len(p1) < 8:
+                    st.error("Usa al menos 8 caracteres.")
+                elif p1 != p2:
+                    st.error("No coinciden.")
+                else:
+                    try:
+                        _set_user_password(st.session_state["pw_setup_email"], p1)
+                        st.success("Contraseña guardada. Ahora inicia sesión.")
+                        st.session_state.pop("pw_setup_email", None)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(str(e))
 
-                    # avoid re-upload on rerun
-                    hk = f"last_photo_hash_{rid}_{it['installation_id']}_{it.get('task_id','')}"
-                    if st.session_state.get(hk) != sha1:
-                        if not drive_ready:
-                            st.error("Drive no conectado: no se puede guardar foto.")
-                        else:
-                            try:
-                                photos_folder, _ = drive_paths_for_report(drive_access, cid, rid)
-                                ext = (up.type.split("/")[-1] if up.type and "/" in up.type else "jpg")
-                                fname = f"{rid}__{it['installation_id']}__{it.get('task_id','noTask')}.{ext}"
-                                with st.spinner("Subiendo foto..."):
-                                    fid = upload_photo_private(drive_access, photos_folder, fname, up.type or "image/jpeg", file_bytes)
-                                reportitem_update(
-                                    rid,
-                                    it["installation_id"],
-                                    it.get("task_id",""),
-                                    status=status,
-                                    note=note,
-                                    photo_drive_file_id=fid,
-                                    photo_sha1=sha1,
-                                )
-                                st.session_state[hk] = sha1
-                                st.success("Foto guardada ✅")
-                            except Exception as e:
-                                st.error("Error subiendo foto.")
-                                st.exception(e)
+    with colB:
+        st.subheader("🎟️ Activar invitación (usuario nuevo)")
+        st.caption("Si un Admin te dio un código, actívalo aquí y luego define tu contraseña.")
+        with st.form("redeem_form"):
+            email2 = st.text_input("Email (invitación)", key="inv_email")
+            code = st.text_input("Código", key="inv_code")
+            submit2 = st.form_submit_button("Activar")
+        if submit2:
+            ok, msg = redeem_invite(email2, code)
+            if ok:
+                st.success(msg)
+                st.session_state["pw_setup_email"] = _norm_email(email2)
+            else:
+                st.error(msg)
 
-                # show photo status (no link)
-                if it.get("photo_drive_file_id"):
-                    st.caption("📷 Foto vinculada (privada).")
+
+# ============================================================
+# UI: MODULES
+# ============================================================
+
+def module_users(user: dict):
+    st.subheader("👥 Módulo Usuarios (Admins)")
+    st.caption("Admins pueden crear invitaciones, asignar roles y comunidades, y eliminar usuarios (excepto bootstrap).")
+
+    users = get_users_df()
+    invites = get_invites_df()
+    comms = get_communities_df()
+
+    st.markdown("#### Crear invitación")
+    with st.form("invite_form"):
+        email = st.text_input("Email a invitar")
+        role_label = st.selectbox("Rol (etiqueta)", [ROLE_ADMIN] + NON_ADMIN_ROLES + [ROLE_VIEWER], index=1)
+        base_role = ROLE_ADMIN if role_label == ROLE_ADMIN else (ROLE_VIEWER if role_label == ROLE_VIEWER else ROLE_MAP.get(role_label, ROLE_EDITOR))
+
+        # Comunidades a asignar
+        comm_options = [(r["community_id"], r["name"]) for _, r in comms[comms["is_active"]].iterrows()] if not comms.empty else []
+        selected = st.multiselect("Comunidades (vacío = ninguna)", options=comm_options, format_func=lambda x: x[1])
+        communities_csv = ",".join([cid for (cid, _) in selected]) if selected else ""
+        if base_role == ROLE_ADMIN:
+            communities_csv = "*"  # Admin acceso total
+
+        submit = st.form_submit_button("Generar código")
+    if submit:
+        try:
+            code = create_invite(
+                email=email,
+                role=base_role,
+                role_label=role_label,
+                communities_csv=communities_csv,
+                created_by=user["email"],
+            )
+            st.success("Invitación creada ✅")
+            st.code(f"CÓDIGO: {code}", language="text")
+            st.info("Comparte el código al usuario por un canal seguro.")
+        except Exception as e:
+            st.error(str(e))
 
     st.divider()
 
-    # Status control at bottom (Draft/Final) + Finalize => generate PDF & upload to Drive
-    st.subheader("Estado del informe")
-    current = rep.get("status","Draft")
-    new_status = st.radio("Guardar como", options=["Draft","Final"], index=0 if current=="Draft" else 1, horizontal=True)
+    st.markdown("#### Usuarios activos")
+    if users.empty:
+        st.info("Sin usuarios.")
+        return
 
-    col1, col2, col3 = st.columns([1.2, 1.2, 2])
-    with col1:
-        if st.button("Guardar estado", type="secondary"):
-            report_set_status(rid, new_status)
-            st.success("Estado guardado ✅")
-            st.rerun()
+    show = users.copy()
+    show["is_bootstrap"] = show["email"].astype(str).str.lower().isin(BOOTSTRAP_ADMINS)
+    st.dataframe(show[["email", "role", "role_label", "status", "communities_csv", "last_login", "is_bootstrap"]], use_container_width=True)
 
-    with col2:
-        if new_status == "Final":
-            if st.button("✅ Finalizar y generar PDF", type="primary", disabled=not drive_ready):
+    st.markdown("#### Editar / Eliminar usuario")
+    emails = show["email"].astype(str).tolist()
+    pick = st.selectbox("Selecciona usuario", emails)
+    row = show[show["email"].astype(str) == pick].iloc[0].to_dict()
+
+    c1, c2, c3 = st.columns([1, 1, 1.2])
+    with c1:
+        new_role_label = st.selectbox("Rol (etiqueta)", [ROLE_ADMIN] + NON_ADMIN_ROLES + [ROLE_VIEWER], index=([ROLE_ADMIN] + NON_ADMIN_ROLES + [ROLE_VIEWER]).index(row["role_label"]) if row["role_label"] in ([ROLE_ADMIN] + NON_ADMIN_ROLES + [ROLE_VIEWER]) else 1)
+    with c2:
+        new_base_role = ROLE_ADMIN if new_role_label == ROLE_ADMIN else (ROLE_VIEWER if new_role_label == ROLE_VIEWER else ROLE_MAP.get(new_role_label, ROLE_EDITOR))
+        st.write(f"Rol técnico: **{new_base_role}**")
+    with c3:
+        new_status = st.selectbox("Estado", ["active", "disabled"], index=0 if row["status"] == "active" else 1)
+
+    # Comunidades
+    comms = get_communities_df()
+    comm_options = [(r["community_id"], r["name"]) for _, r in comms[comms["is_active"]].iterrows()] if not comms.empty else []
+    current_csv = (row.get("communities_csv") or "").strip()
+    current_set = set([x.strip() for x in current_csv.split(",") if x.strip()])
+    preselect = [opt for opt in comm_options if opt[0] in current_set]
+
+    if new_base_role == ROLE_ADMIN:
+        st.info("Admin: comunidades se fijan a '*' (acceso total).")
+        chosen_csv = "*"
+    else:
+        chosen = st.multiselect("Comunidades asignadas", options=comm_options, default=preselect, format_func=lambda x: x[1])
+        chosen_csv = ",".join([cid for (cid, _) in chosen])
+
+    colS, colD = st.columns([1, 1])
+    with colS:
+        if st.button("💾 Guardar cambios", use_container_width=True):
+            try:
+                df = get_users_df()
+                mask = df["email"].astype(str).str.lower() == _norm_email(pick)
+                if not mask.any():
+                    st.error("No encontrado.")
+                else:
+                    df.loc[mask, "role"] = new_base_role
+                    df.loc[mask, "role_label"] = new_role_label
+                    df.loc[mask, "status"] = new_status
+                    df.loc[mask, "communities_csv"] = chosen_csv
+                    _df_to_sheet_overwrite(TAB_USERS, USERS_HEADERS, df)
+                    st.success("Actualizado ✅")
+                    st.rerun()
+            except Exception as e:
+                st.error(str(e))
+
+    with colD:
+        is_bootstrap = _norm_email(pick) in BOOTSTRAP_ADMINS
+        if is_bootstrap:
+            st.warning("Bootstrap: no se puede eliminar.")
+        else:
+            if st.button("🗑️ Eliminar usuario definitivamente", use_container_width=True):
                 try:
-                    report_set_status(rid, "Final")  # lock
-                    rep2 = report_get(rid) or rep
-                    # re-read items to include latest
-                    items2 = reportitems_for_report(rid)
-
-                    # build pdf bytes (downloads photos internally)
-                    pdf_bytes = build_pdf_bytes(
-                        community_name=cname,
-                        report_id=rid,
-                        created_by=rep2.get("created_by_email",""),
-                        created_at_iso=rep2.get("created_at",""),
-                        items=items2,
-                        drive_access_token=drive_access,
-                    )
-
-                    # upload pdf to drive
-                    _, pdfs_folder = drive_paths_for_report(drive_access, cid, rid)
-                    pdf_name = f"{cname}__{rid}.pdf".replace("/", "-")
-                    with st.spinner("Subiendo PDF a Drive..."):
-                        pdf_file_id = upload_pdf_private(drive_access, pdfs_folder, pdf_name, pdf_bytes)
-
-                    report_set_pdf(rid, pdf_file_id, pdf_name)
-                    st.success("Informe FINAL y PDF guardado ✅")
-                    st.info("Puedes descargarlo desde el Módulo Resumen.")
+                    df = get_users_df()
+                    df = df[df["email"].astype(str).str.lower() != _norm_email(pick)].copy()
+                    _df_to_sheet_overwrite(TAB_USERS, USERS_HEADERS, df)
+                    st.success("Eliminado ✅")
                     st.rerun()
                 except Exception as e:
-                    st.error("Error generando/subiendo PDF.")
-                    st.exception(e)
-                    # roll back to draft to avoid lock in test
-                    report_set_status(rid, "Draft")
+                    st.error(str(e))
 
-    with col3:
-        st.caption("Nota: al finalizar, se bloquea edición y el PDF queda guardado en Drive (privado).")
+    st.divider()
+    st.markdown("#### Invitaciones pendientes")
+    inv = invites.copy()
+    if inv.empty:
+        st.info("No hay invitaciones.")
+    else:
+        inv["is_active"] = inv["used_at"].astype(str).str.strip().eq("")
+        st.dataframe(inv[["email", "role_label", "role", "communities_csv", "expires_at", "created_by", "used_at"]], use_container_width=True)
 
 
-def ui_summary(current_user: str) -> None:
-    st.header("📊 Módulo Resumen")
+def module_communities(user: dict):
+    st.subheader("🏢 Módulo Comunidades (Admins)")
+    st.caption("Crear/Eliminar comunidades y administrar instalaciones + tareas por comunidad. (Foto de comunidad opcional)")
 
-    # determine which reports user can view
-    allowed = user_allowed_communities(current_user)
-    if not allowed:
+    comms = get_communities_df()
+
+    with st.expander("➕ Crear nueva comunidad", expanded=True):
+        name = st.text_input("Nombre comunidad", placeholder="Ej: Edificio A / Comunidad Las Palmas")
+        if st.button("Crear comunidad"):
+            try:
+                comm_id = create_community(name)
+                st.success("Comunidad creada ✅")
+                st.code(comm_id)
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
+
+    st.divider()
+
+    comms = get_communities_df()
+    if comms.empty:
+        st.info("Aún no hay comunidades.")
+        return
+
+    comm_opts = [(r["community_id"], r["name"]) for _, r in comms.iterrows()]
+    pick = st.selectbox("Selecciona comunidad", comm_opts, format_func=lambda x: x[1])
+    comm_id = pick[0]
+    comm_name = pick[1]
+
+    colA, colB = st.columns([1, 1])
+    with colA:
+        st.markdown("#### Configuración comunidad")
+        active = st.checkbox("Activa", value=True if comms[comms["community_id"] == comm_id]["is_active"].iloc[0] else False)
+        if st.button("Guardar estado"):
+            try:
+                _update_row_by_id(TAB_COMMUNITIES, COMMUNITIES_HEADERS, "community_id", comm_id, {"is_active": "TRUE" if active else "FALSE", "updated_at": _now_iso()})
+                st.success("Actualizado ✅")
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
+
+        st.markdown("#### Foto (opcional)")
+        st.caption("Para una interfaz más atractiva. (Sube y se guardará en Drive solo si Drive está conectado)")
+        up = st.file_uploader("Subir foto comunidad", type=["png", "jpg", "jpeg"])
+        if up and st.button("Guardar foto"):
+            try:
+                # requiere Drive conectado
+                img_bytes = up.getvalue()
+                fname = f"community_{comm_name}_{uuid.uuid4().hex[:6]}.jpg"
+                fid, link = drive_upload_bytes(img_bytes, fname, up.type or "image/jpeg", DRIVE_REPORTS_FOLDER_ID)
+                _update_row_by_id(TAB_COMMUNITIES, COMMUNITIES_HEADERS, "community_id", comm_id, {"photo_drive_file_id": fid, "updated_at": _now_iso()})
+                st.success("Foto guardada ✅ (Drive)")
+            except Exception as e:
+                st.error(str(e))
+
+        st.markdown("#### Eliminar comunidad (definitivo)")
+        st.warning("Esto borrará también instalaciones/tareas/reportes de esa comunidad en Sheets.")
+        confirm = st.text_input("Escribe ELIMINAR para confirmar", key="del_comm_confirm")
+        if st.button("🗑️ Eliminar definitivamente", disabled=(confirm.strip().upper() != "ELIMINAR")):
+            try:
+                delete_community_permanent(comm_id)
+                st.success("Eliminada ✅")
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
+
+    with colB:
+        st.markdown("#### Datos maestros (xlsx)")
+        tpl = build_master_template_xlsx()
+        st.download_button("⬇️ Descargar plantilla MasterData.xlsx", data=tpl, file_name="MasterData.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.caption("Puedes cargar la plantilla para crear instalaciones + tareas. Opción de reemplazar todo.")
+        upx = st.file_uploader("Cargar MasterData.xlsx", type=["xlsx"], key="master_upload")
+        replace = st.checkbox("Reemplazar TODO (instalaciones+tareas) de esta comunidad", value=False)
+        if upx and st.button("Importar plantilla"):
+            try:
+                import_master_template_xlsx(upx.getvalue(), comm_id, replace_all=replace)
+                st.success("Importado ✅")
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
+
+    st.divider()
+    st.markdown("## Instalaciones y tareas")
+
+    idf = get_installations_df()
+    tdf = get_tasks_df()
+    idf2 = idf[idf["community_id"].astype(str) == str(comm_id)].copy()
+
+    with st.expander("➕ Añadir instalación", expanded=False):
+        cat = st.selectbox("Tipo/Categoría", CATEGORIES_DEFAULT)
+        inst = st.text_input("Nombre instalación", placeholder="Ej: Sala de Bombas")
+        if st.button("Guardar instalación"):
+            try:
+                inst_id = upsert_installation(comm_id, cat, inst)
+                st.success("Instalación guardada ✅")
+                st.code(inst_id)
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
+
+    if idf2.empty:
+        st.info("No hay instalaciones para esta comunidad.")
+        return
+
+    # UI por instalación
+    for _, inst_row in idf2.sort_values(["category", "installation"]).iterrows():
+        inst_id = inst_row["installation_id"]
+        cat = inst_row["category"]
+        inst_name = inst_row["installation"]
+
+        box = st.container(border=True)
+        with box:
+            h1, h2 = st.columns([3, 1])
+            with h1:
+                st.markdown(f"**{cat} — {inst_name}**")
+            with h2:
+                if st.button("Eliminar instalación", key=f"del_inst_{inst_id}"):
+                    try:
+                        delete_installation(inst_id)
+                        st.success("Eliminada ✅")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(str(e))
+
+            # tareas
+            tasks = tdf[tdf["installation_id"].astype(str) == str(inst_id)].copy()
+            if tasks.empty:
+                st.caption("Sin tareas (aún).")
+            else:
+                for _, t in tasks.sort_values(["task"]).iterrows():
+                    c1, c2 = st.columns([5, 1])
+                    with c1:
+                        st.write(f"- {t['task']}")
+                    with c2:
+                        if st.button("🗑️", key=f"del_task_{t['task_id']}"):
+                            try:
+                                delete_task(t["task_id"])
+                                st.rerun()
+                            except Exception as e:
+                                st.error(str(e))
+
+            with st.expander("➕ Añadir tarea", expanded=False):
+                task_txt = st.text_input("Tarea", key=f"task_txt_{inst_id}", placeholder="Ej: Presión y alternancia")
+                if st.button("Guardar tarea", key=f"save_task_{inst_id}"):
+                    try:
+                        upsert_task(inst_id, task_txt)
+                        st.success("Tarea guardada ✅")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(str(e))
+
+
+def module_informes(user: dict):
+    st.subheader("🧾 Módulo Informes (creación)")
+    st.caption("Selecciona comunidad asignada, crea informe nuevo o continúa el borrador. Guarda Draft/Final y exporta PDF/Word (con fotos incrustadas).")
+
+    comms = get_communities_df()
+    if comms.empty:
+        st.info("No hay comunidades.")
+        return
+
+    # comunidades visibles según permisos
+    visible = []
+    for _, r in comms[comms["is_active"]].iterrows():
+        if user["role"] == ROLE_ADMIN:
+            visible.append((r["community_id"], r["name"]))
+        else:
+            if _can_access_community(user, r["community_id"]):
+                visible.append((r["community_id"], r["name"]))
+
+    if not visible:
         st.warning("No tienes comunidades asignadas.")
         return
 
-    can_view = user_is_admin(current_user)
-    if not can_view:
-        # if any access row with can_view_summary true
-        rows = access_list_for_user(current_user)
-        can_view = any(r.get("can_view_summary","false").lower()=="true" for r in rows)
+    pick = st.selectbox("Comunidad", visible, format_func=lambda x: x[1])
+    community_id, community_name = pick[0], pick[1]
 
-    if not can_view:
-        st.error("No tienes permiso para ver el resumen.")
-        return
+    # elegir informe
+    c1, c2, c3 = st.columns([1, 1, 1.5])
+    with c1:
+        rep_date = st.date_input("Fecha informe", value=date.today())
+        rep_date_str = rep_date.isoformat()
+    with c2:
+        latest_draft = get_latest_draft_report(community_id)
+        action = st.radio(
+            "Acción",
+            options=["Nuevo informe", "Continuar borrador"],
+            index=1 if latest_draft else 0,
+            horizontal=True,
+        )
+    with c3:
+        st.caption("Tip: Draft permite retomar. Final habilita export y se guarda en Drive.")
 
-    _, reps = read_table("Reports")
-    reps = [r for r in reps if r.get("community_id") in allowed] if not user_is_admin(current_user) else reps
+    if "active_report_id" not in st.session_state:
+        st.session_state["active_report_id"] = None
 
-    # filters
-    comms = list_communities(active_only=True)
-    comm_map = {c["community_id"]: c["name"] for c in comms}
-    reps = [r for r in reps if r.get("community_id") in comm_map]  # remove deleted comms
+    if action == "Nuevo informe":
+        if st.button("➕ Crear informe"):
+            rid = create_report(community_id, rep_date_str, user["email"])
+            st.session_state["active_report_id"] = rid
+            st.success("Informe creado ✅")
+            st.rerun()
+    else:
+        if latest_draft and st.button("▶️ Abrir borrador"):
+            st.session_state["active_report_id"] = latest_draft
+            st.rerun()
+        elif not latest_draft:
+            st.info("No hay borrador reciente para esta comunidad.")
 
-    colF1, colF2, colF3 = st.columns(3)
-    with colF1:
-        comm_opts = ["(Todas)"] + sorted({comm_map[r["community_id"]] for r in reps})
-        f_comm = st.selectbox("Comunidad", options=comm_opts)
-    with colF2:
-        f_user = st.text_input("Filtrar por usuario (email contiene)", placeholder="ej: juan")
-    with colF3:
-        f_status = st.selectbox("Estado", options=["(Todos)", "Final", "Draft"])
+    report_id = st.session_state.get("active_report_id")
+    if not report_id:
+        st.stop()
 
-    # apply filters
-    if f_comm != "(Todas)":
-        cidset = {cid for cid, name in comm_map.items() if name == f_comm}
-        reps = [r for r in reps if r.get("community_id") in cidset]
-    if f_user.strip():
-        reps = [r for r in reps if f_user.strip().lower() in (r.get("created_by_email","").lower())]
-    if f_status != "(Todos)":
-        reps = [r for r in reps if (r.get("status","") == f_status)]
+    # Carga matriz checklist
+    matrix = build_report_matrix(community_id)
+    if matrix.empty:
+        st.warning("Esta comunidad no tiene instalaciones/tareas. Admin debe configurarlas en Módulo Comunidades.")
+        st.stop()
 
-    # sort recent
-    reps.sort(key=lambda x: x.get("created_at",""), reverse=True)
+    # Estado actual del reporte
+    rdf = get_reports_df()
+    rrow = rdf[rdf["report_id"].astype(str) == str(report_id)]
+    if rrow.empty:
+        st.error("Informe no encontrado.")
+        st.stop()
+    rrow = rrow.iloc[0].to_dict()
+    rstatus = str(rrow.get("status", "draft")).lower()
 
-    if not reps:
-        st.info("No hay informes con esos filtros.")
-        return
+    # ReportItems existentes
+    items_df = load_reportitems(report_id)
+    # Index rápido por (category, installation, task)
+    idx = {}
+    if not items_df.empty:
+        for _, rr in items_df.iterrows():
+            key = (str(rr["category"]), str(rr["installation"]), str(rr["task"]))
+            idx[key] = rr.to_dict()
 
-    # drive token needed to download PDFs
-    drive_ready = True
-    try:
-        drive_access = get_drive_access_token_or_raise()
-    except Exception:
-        drive_ready = False
-        drive_access = ""
+    # UI: checklist 3 columnas visual
+    st.markdown("---")
+    st.markdown(f"### Informe: **{community_name}**  •  Estado: **{rstatus.upper()}**  •  ID: `{report_id}`")
 
-    st.caption("Tabla de informes. Descarga disponible solo para informes FINAL con PDF guardado.")
-    for r in reps[:200]:
-        cname = comm_map.get(r["community_id"], r.get("community_name",""))
-        with st.container(border=True):
-            c1, c2, c3, c4 = st.columns([2.4, 2.2, 1.2, 1.6], gap="medium")
-            c1.write(f"**{cname}**")
-            c2.write(f"{r.get('created_at','')}\n\n{r.get('created_by_email','')}")
-            c3.write(f"**{r.get('status','')}**")
-            pdf_id = r.get("drive_pdf_file_id","")
-            if not pdf_id or r.get("status") != "Final":
-                c4.caption("Sin PDF")
-            else:
-                if not drive_ready:
-                    c4.caption("Drive no conectado")
-                else:
-                    if c4.button("⬇️ Descargar PDF", key=f"dl_{r['report_id']}"):
-                        try:
-                            pdf_bytes = drive_files_get_media(drive_access, pdf_id)
-                            st.download_button(
-                                "Descargar ahora",
-                                data=pdf_bytes,
-                                file_name=r.get("drive_pdf_filename") or f"{r['report_id']}.pdf",
-                                mime="application/pdf",
-                                key=f"dlbtn_{r['report_id']}",
-                                use_container_width=True,
+    # Stats
+    def _count_stats(df_items: pd.DataFrame):
+        if df_items.empty:
+            return 0, 0, len(matrix), len(matrix)
+        s = df_items["status"].astype(str).str.lower()
+        ok = int((s == "ok").sum())
+        fail = int((s == "fail").sum())
+        pending = int((s != "ok").sum() - fail)  # pending/otros
+        return ok, fail, pending, ok + fail + pending
+
+    okc, failc, pendc, totc = _count_stats(items_df)
+    header_card(okc, failc, pendc)
+
+    st.markdown("#### Checklist (estructura visual 3 columnas)")
+    st.caption("Las filas con FALLA se marcan con fondo rojo suave. Guardas cuando termines (botón abajo).")
+
+    # edición en memoria
+    edited_rows = []
+
+    # agrupar por categoría e instalación
+    for cat in matrix["category"].drop_duplicates().tolist():
+        st.markdown(f"### {cat}")
+        mcat = matrix[matrix["category"] == cat]
+        for inst_name in mcat["installation"].drop_duplicates().tolist():
+            minst = mcat[mcat["installation"] == inst_name]
+
+            for _, row in minst.iterrows():
+                task = row["task"]
+                key = (cat, inst_name, task)
+                existing = idx.get(key, {})
+                cur_status = str(existing.get("status", "pending")).lower() or "pending"
+                cur_note = str(existing.get("note", "") or "")
+                cur_photo_b64 = existing.get("photo_b64", "")
+                cur_photo_mime = existing.get("photo_mime", "")
+
+                bg = "#fee2e2" if cur_status == "fail" else "#ffffff"
+                box = st.container(border=True)
+                with box:
+                    st.markdown(
+                        f"""
+                        <div style="background:{bg}; padding:10px 12px; border-radius:12px;">
+                          <div style="font-weight:900;">{inst_name}</div>
+                          <div style="opacity:0.75; font-size:12px;">Tarea: {task}</div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+                    cL, cM, cR = st.columns([2.4, 2.4, 1.7], gap="medium")
+
+                    with cL:
+                        st.write("**Categoría / Instalación / Tarea**")
+                        st.caption(f"{cat} • {inst_name} • {task}")
+
+                    with cM:
+                        st.write("**Estado + Observación**")
+                        status = st.radio(
+                            "Estado",
+                            options=["pending", "ok", "fail"],
+                            index=["pending", "ok", "fail"].index(cur_status) if cur_status in ["pending", "ok", "fail"] else 0,
+                            format_func=lambda v: {"pending": "Pendiente", "ok": "OK", "fail": "Falla"}[v],
+                            horizontal=True,
+                            key=f"st_{report_id}_{hash(key)}",
+                            label_visibility="collapsed",
+                        )
+                        note = st.text_input(
+                            "Observación",
+                            value=cur_note,
+                            placeholder="Observación breve…",
+                            key=f"nt_{report_id}_{hash(key)}",
+                            label_visibility="collapsed",
+                        )
+
+                    with cR:
+                        st.write("**Foto (opcional)**")
+                        up = st.file_uploader(
+                            "Subir",
+                            type=["png", "jpg", "jpeg"],
+                            key=f"ph_{report_id}_{hash(key)}",
+                            label_visibility="collapsed",
+                        )
+                        photo_bytes = None
+                        photo_mime = ""
+                        if up is not None:
+                            photo_bytes = up.getvalue()
+                            photo_mime = up.type or "image/jpeg"
+                            st.image(photo_bytes, use_container_width=True, caption="Vista previa")
+                        elif cur_photo_b64:
+                            # muestra miniatura si ya existe
+                            try:
+                                pb = base64.b64decode(cur_photo_b64)
+                                st.image(pb, use_container_width=True, caption="Foto guardada")
+                            except Exception:
+                                st.caption("Foto guardada (no visualizable).")
+
+                # construye registro report item
+                out = {
+                    "report_item_id": existing.get("report_item_id") or str(uuid.uuid4()),
+                    "report_id": report_id,
+                    "category": cat,
+                    "installation": inst_name,
+                    "task": task,
+                    "status": status,
+                    "note": note,
+                    "photo_mime": photo_mime or cur_photo_mime,
+                    "photo_b64": base64.b64encode(photo_bytes).decode("utf-8") if photo_bytes else (cur_photo_b64 or ""),
+                    "updated_at": _now_iso(),
+                }
+                edited_rows.append(out)
+
+    # Guardar
+    st.markdown("---")
+    st.markdown("### Estado del informe")
+    st.caption("Draft: permite retomar después. Final: habilita exportación.")
+    new_status = st.radio("Estado", options=["draft", "final"], index=0 if rstatus == "draft" else 1, horizontal=True)
+    if st.button("💾 Guardar cambios", use_container_width=True):
+        try:
+            df_save = pd.DataFrame(edited_rows, columns=REPORTITEMS_HEADERS).fillna("")
+            save_reportitems(report_id, df_save)
+            set_report_status(report_id, new_status)
+            st.success("Guardado ✅")
+            st.rerun()
+        except Exception as e:
+            st.error(str(e))
+
+    # Export (solo si final)
+    if new_status == "final":
+        st.markdown("### Descargar / Guardar en Drive")
+        st.caption("Export visual 3 columnas (categoría/instalación/tarea | estado/obs | foto). Si Drive está conectado, se sube a Mi unidad.")
+
+        # reconstruye rows para export (desde edited_rows, no desde sheet)
+        export_rows = []
+        for r in edited_rows:
+            pb = None
+            if r.get("photo_b64"):
+                try:
+                    pb = base64.b64decode(r["photo_b64"])
+                except Exception:
+                    pb = None
+            export_rows.append({
+                "category": r["category"],
+                "installation": r["installation"],
+                "task": r["task"],
+                "status": r["status"],
+                "note": r["note"],
+                "photo_bytes": pb,
+                "photo_mime": r.get("photo_mime", ""),
+            })
+
+        col1, col2 = st.columns([1, 1])
+
+        with col1:
+            if st.button("📄 Generar PDF", use_container_width=True):
+                try:
+                    pdf_bytes = export_pdf_visual(community_name, rep_date_str, export_rows)
+                    st.download_button(
+                        "⬇️ Descargar PDF",
+                        data=pdf_bytes,
+                        file_name=f"informe_{community_name}_{rep_date_str}.pdf".replace(" ", "_"),
+                        mime="application/pdf",
+                        use_container_width=True,
+                    )
+                    # subir a Drive
+                    try:
+                        if DRIVE_REPORTS_FOLDER_ID:
+                            fid, link = drive_upload_bytes(
+                                pdf_bytes,
+                                filename=f"informe_{community_name}_{rep_date_str}.pdf".replace(" ", "_"),
+                                mime_type="application/pdf",
+                                parent_folder_id=DRIVE_REPORTS_FOLDER_ID,
                             )
-                        except Exception as e:
-                            st.error("Error descargando PDF.")
-                            st.exception(e)
+                            _update_row_by_id(
+                                TAB_REPORTS, REPORTS_HEADERS, "report_id", report_id,
+                                {"drive_pdf_file_id": fid, "drive_pdf_link": link, "updated_at": _now_iso()}
+                            )
+                            st.success("PDF subido a Drive ✅")
+                            if link:
+                                st.link_button("Abrir PDF en Drive", link)
+                    except Exception as e:
+                        st.info(f"PDF generado. Drive: {e}")
+                except Exception as e:
+                    st.error(str(e))
+
+        with col2:
+            if st.button("📝 Generar Word (DOCX)", use_container_width=True):
+                try:
+                    docx_bytes = export_docx_visual(community_name, rep_date_str, export_rows)
+                    st.download_button(
+                        "⬇️ Descargar DOCX",
+                        data=docx_bytes,
+                        file_name=f"informe_{community_name}_{rep_date_str}.docx".replace(" ", "_"),
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        use_container_width=True,
+                    )
+                    # subir a Drive
+                    try:
+                        if DRIVE_REPORTS_FOLDER_ID:
+                            fid, link = drive_upload_bytes(
+                                docx_bytes,
+                                filename=f"informe_{community_name}_{rep_date_str}.docx".replace(" ", "_"),
+                                mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                parent_folder_id=DRIVE_REPORTS_FOLDER_ID,
+                            )
+                            _update_row_by_id(
+                                TAB_REPORTS, REPORTS_HEADERS, "report_id", report_id,
+                                {"drive_docx_file_id": fid, "drive_docx_link": link, "updated_at": _now_iso()}
+                            )
+                            st.success("DOCX subido a Drive ✅")
+                            if link:
+                                st.link_button("Abrir DOCX en Drive", link)
+                    except Exception as e:
+                        st.info(f"DOCX generado. Drive: {e}")
+                except Exception as e:
+                    st.error(str(e))
+    else:
+        st.info("Para descargar, cambia el estado a FINAL y guarda.")
 
 
-# -------------------------
-# Main
-# -------------------------
+def module_resumen(user: dict):
+    st.subheader("📊 Módulo Resumen (historial)")
+    st.caption("Tabla de informes: Comunidad | Fecha | Usuario | Descarga (PDF/DOCX). Filtra por comunidad, usuario y rango de fechas.")
+
+    comms = get_communities_df()
+    reports = get_reports_df()
+    if reports.empty:
+        st.info("No hay informes.")
+        return
+
+    # joins
+    comm_map = {}
+    if not comms.empty:
+        for _, r in comms.iterrows():
+            comm_map[str(r["community_id"])] = str(r["name"])
+
+    rep = reports.copy()
+    rep["community_name"] = rep["community_id"].astype(str).map(comm_map).fillna(rep["community_id"].astype(str))
+    rep["report_date"] = rep["report_date"].astype(str)
+
+    # filtros permisos
+    if user["role"] != ROLE_ADMIN:
+        allowed_ids = set([x.strip() for x in (user.get("communities_csv") or "").split(",") if x.strip()])
+        rep = rep[rep["community_id"].astype(str).isin(allowed_ids)].copy()
+
+    if rep.empty:
+        st.warning("No tienes informes accesibles según tus comunidades asignadas.")
+        return
+
+    # filtros UI
+    col1, col2, col3 = st.columns([1.2, 1.2, 1.6])
+    with col1:
+        comm_filter = st.multiselect(
+            "Filtrar comunidad",
+            options=sorted(rep["community_name"].unique().tolist()),
+        )
+    with col2:
+        user_filter = st.multiselect(
+            "Filtrar por usuario",
+            options=sorted(rep["created_by"].astype(str).unique().tolist()),
+        )
+    with col3:
+        # rango fechas simple
+        dmin = rep["report_date"].min()
+        dmax = rep["report_date"].max()
+        try:
+            d1 = date.fromisoformat(dmin)
+            d2 = date.fromisoformat(dmax)
+        except Exception:
+            d1, d2 = date.today() - timedelta(days=30), date.today()
+        rng = st.date_input("Rango fechas", value=(d1, d2))
+
+    if comm_filter:
+        rep = rep[rep["community_name"].isin(comm_filter)].copy()
+    if user_filter:
+        rep = rep[rep["created_by"].isin(user_filter)].copy()
+
+    if isinstance(rng, tuple) and len(rng) == 2:
+        a, b = rng
+        rep = rep[(rep["report_date"] >= a.isoformat()) & (rep["report_date"] <= b.isoformat())].copy()
+
+    rep = rep.sort_values(["report_date", "updated_at"], ascending=[False, False])
+
+    # tabla visual + links
+    view = rep[[
+        "community_name", "report_date", "status", "created_by",
+        "drive_pdf_link", "drive_docx_link", "updated_at"
+    ]].copy()
+
+    st.dataframe(view, use_container_width=True)
+
+    st.caption("Si el informe tiene link Drive, puedes abrirlo desde aquí:")
+    for _, r in view.head(15).iterrows():
+        line = f"**{r['community_name']}** • {r['report_date']} • {r['created_by']} • {str(r['status']).upper()}"
+        st.write(line)
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            if str(r.get("drive_pdf_link", "")).strip():
+                st.link_button("Abrir PDF", r["drive_pdf_link"])
+        with c2:
+            if str(r.get("drive_docx_link", "")).strip():
+                st.link_button("Abrir DOCX", r["drive_docx_link"])
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
 def main():
-    # Ensure base schema (test-mode). If you're changing schemas often, set force_reset=True.
-    ensure_tabs_and_headers(force_reset=False)
-    ensure_bootstrap_users()
+    # auth
+    if not current_user():
+        login_screen()
+        return
 
-    # Gate
-    if "user_email" not in st.session_state:
-        user, ok = ui_access_gate()
-        if not ok:
-            st.stop()
-        st.rerun()
+    user = current_user()
 
-    current_user = st.session_state["user_email"]
+    # sidebar
+    st.sidebar.title("Menú")
+    st.sidebar.write(f"**{user['email']}**")
+    st.sidebar.caption(f"Rol: {user.get('role_label', user.get('role'))} ({user.get('role')})")
 
-    # Top bar
-    st.sidebar.markdown("## 🛡️ Control Comunidades")
-    st.sidebar.write(f"**Usuario:** {current_user}")
-    if st.sidebar.button("Cerrar sesión"):
-        st.session_state.clear()
-        st.rerun()
+    if st.sidebar.button("Cerrar sesión", use_container_width=True):
+        _logout()
 
-    # Modules per role
-    is_admin = user_is_admin(current_user)
+    # Drive OAuth UI (solo admin)
+    drive_oauth_ui(user)
+
+    base_role = _role_base(user.get("role"))
 
     modules = []
-    if is_admin:
-        modules = ["Admin • Usuarios", "Admin • Comunidades", "Admin • Drive", "Informes", "Resumen"]
+    if base_role == ROLE_ADMIN:
+        modules = ["Usuarios", "Comunidades", "Informes", "Resumen"]
+    elif base_role == ROLE_EDITOR:
+        modules = ["Informes", "Resumen"]
     else:
-        # based on access flags (can_create_reports / can_view_summary)
-        rows = access_list_for_user(current_user)
-        can_create = any(r.get("can_create_reports","false").lower()=="true" for r in rows)
-        can_view = any(r.get("can_view_summary","false").lower()=="true" for r in rows)
-        modules = []
-        if can_create:
-            modules.append("Informes")
-        if can_view:
-            modules.append("Resumen")
-        if not modules:
-            modules = ["Resumen"]  # conservative fallback
+        modules = ["Resumen"]
 
-    pick = st.sidebar.radio("Módulo", options=modules)
+    mod = st.sidebar.radio("Módulo", options=modules)
 
-    if pick == "Admin • Usuarios":
-        ui_admin_users(current_user)
-    elif pick == "Admin • Comunidades":
-        ui_admin_communities(current_user)
-    elif pick == "Admin • Drive":
-        ui_drive_connect_admin(current_user)
-    elif pick == "Informes":
-        ui_reports(current_user)
-    elif pick == "Resumen":
-        ui_summary(current_user)
+    # content
+    if mod == "Usuarios":
+        module_users(user)
+    elif mod == "Comunidades":
+        module_communities(user)
+    elif mod == "Informes":
+        module_informes(user)
+    elif mod == "Resumen":
+        module_resumen(user)
 
-    st.sidebar.markdown("---")
-    st.sidebar.caption("Sheets: Service Account • Drive: OAuth (Mi unidad) • Fotos/PDF privados")
+    st.markdown(
+        "<div style='opacity:0.6; font-size:12px; margin-top:18px;'>Control Comunidades • Sheets+Drive • Esquema Tasks/Reports/ReportItems • Testing</div>",
+        unsafe_allow_html=True,
+    )
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        ensure_schema()
+        main()
+    except Exception as e:
+        st.error("Error crítico inicializando la app.")
+        st.exception(e)
