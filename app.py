@@ -1751,7 +1751,8 @@ def module_communities(user: dict):
                                 try:
                                     delete_task(t["task_id"])
                                     st.rerun()
-                                except Exception as e:
+                                except Exception:
+                                    pass
                 with st.form(key=f"add_task_form_{inst_id}", clear_on_submit=True):
                     task_txt = st.text_input("Tarea", key=f"task_txt_{inst_id}", placeholder="Ej: Presión y alternancia")
                     submitted_task = st.form_submit_button("Guardar tarea")
